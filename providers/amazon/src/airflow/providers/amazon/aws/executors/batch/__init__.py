@@ -16,6 +16,9 @@
 # under the License.
 from __future__ import annotations  # Added by precommit hooks
 
-__all__ = ["AwsBatchExecutor"]
+__all__ = ["AwsBatchExecutor", "AwsBatchWorkerPoolExecutor"]
 
 from airflow.providers.amazon.aws.executors.batch.batch_executor import AwsBatchExecutor
+from airflow.providers.amazon.aws.executors.batch.batch_worker_pool_executor import (
+    AwsBatchWorkerPoolExecutor,
+)

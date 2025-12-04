@@ -1117,6 +1117,147 @@ config:
         example: "500"
         default: "0"
 
+  aws_batch_worker_pool_executor:
+    description: |
+      This section only applies if you are using the AwsBatchWorkerPoolExecutor in
+      Airflow's ``[core]`` configuration. This executor spawns on-demand, long-running
+      worker processes in AWS Batch that pull tasks from an SQS queue and execute them
+      in isolated subprocesses.
+    options:
+      conn_id:
+        description: |
+          The Airflow connection (i.e. credentials) used by the executor to make API calls.
+        version_added: ~
+        type: string
+        example: "aws_default"
+        default: "aws_default"
+      region_name:
+        description: |
+          The name of the AWS Region where AWS Batch and SQS are configured.
+        version_added: ~
+        type: string
+        example: "us-east-1"
+        default: ~
+      job_queue:
+        description: |
+          The AWS Batch job queue where worker jobs are submitted.
+        version_added: ~
+        type: string
+        example: "airflow-worker-pool-queue"
+        default: ~
+      job_definition:
+        description: |
+          The AWS Batch job definition for worker containers.
+        version_added: ~
+        type: string
+        example: "airflow-worker-pool:1"
+        default: ~
+      worker_job_name_prefix:
+        description: |
+          Prefix for worker job names submitted to AWS Batch.
+        version_added: ~
+        type: string
+        example: "airflow-worker"
+        default: "airflow-worker"
+      task_queue_url:
+        description: |
+          The URL of the SQS queue for distributing tasks to workers.
+        version_added: ~
+        type: string
+        example: "https://sqs.us-east-1.amazonaws.com/123456789/airflow-tasks"
+        default: ~
+      result_queue_url:
+        description: |
+          The URL of the SQS queue for receiving task results from workers.
+        version_added: ~
+        type: string
+        example: "https://sqs.us-east-1.amazonaws.com/123456789/airflow-results"
+        default: ~
+      worker_idle_timeout_seconds:
+        description: |
+          Seconds of idle time before a worker self-terminates.
+        version_added: ~
+        type: integer
+        example: "300"
+        default: "300"
+      worker_max_tasks:
+        description: |
+          Maximum tasks a worker processes before terminating. 0 means unlimited.
+        version_added: ~
+        type: integer
+        example: "0"
+        default: "0"
+      worker_visibility_timeout_seconds:
+        description: |
+          SQS visibility timeout for tasks being processed.
+        version_added: ~
+        type: integer
+        example: "3600"
+        default: "3600"
+      min_workers:
+        description: |
+          Minimum number of workers to keep running.
+        version_added: ~
+        type: integer
+        example: "0"
+        default: "0"
+      max_workers:
+        description: |
+          Maximum number of workers. 0 means use the parallelism setting.
+        version_added: ~
+        type: integer
+        example: "10"
+        default: "0"
+      tasks_per_worker:
+        description: |
+          Number of tasks a single worker can process concurrently.
+        version_added: ~
+        type: integer
+        example: "1"
+        default: "1"
+      check_health_on_startup:
+        description: |
+          Whether to check AWS connectivity on executor startup.
+        version_added: ~
+        type: boolean
+        example: "True"
+        default: "True"
+      worker_health_check_interval_seconds:
+        description: |
+          Interval between worker health checks.
+        version_added: ~
+        type: integer
+        example: "60"
+        default: "60"
+      max_worker_start_attempts:
+        description: |
+          Maximum attempts to start a worker before giving up.
+        version_added: ~
+        type: integer
+        example: "3"
+        default: "3"
+      shared_state_init_module:
+        description: |
+          Python module containing the shared state initialization function.
+        version_added: ~
+        type: string
+        example: "myproject.worker_init"
+        default: ~
+      shared_state_init_function:
+        description: |
+          Function name to call for initializing shared state in workers.
+        version_added: ~
+        type: string
+        example: "initialize"
+        default: "initialize"
+      submit_job_kwargs:
+        description: |
+          Additional JSON parameters to pass to the AWS Batch submit_job API.
+        version_added: ~
+        type: string
+        example: '{"containerOverrides": {"memory": 4096}}'
+        default: ~
+
   aws_ecs_executor:
     description: |
       This section only applies if you are using the AwsEcsExecutor in
@@ -1293,6 +1434,8 @@ config:
 
 executors:
   - airflow.providers.amazon.aws.executors.ecs.ecs_executor.AwsEcsExecutor
+  - airflow.providers.amazon.aws.executors.batch.batch_executor.AwsBatchExecutor
+  - airflow.providers.amazon.aws.executors.batch.batch_worker_pool_executor.AwsBatchWorkerPoolExecutor
 
 auth-managers:
   - airflow.providers.amazon.aws.auth_manager.aws_auth_manager.AwsAuthManager
