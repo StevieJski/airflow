@@ -160,10 +160,29 @@ workers/dotnet/
 │   ├── MySharedState.cs           # Example shared state
 │   └── MyTaskHandler.cs           # Example task handlers
 │
+├── AirflowWorker.Tests/
+│   ├── AirflowWorker.Tests.csproj # Unit tests (xUnit)
+│   ├── ModelsTests.cs             # Tests for message schemas
+│   ├── InterfacesTests.cs         # Tests for interfaces
+│   └── WorkerProcessTests.cs      # Tests for worker logic
+│
 ├── AirflowWorker.sln              # Solution file
 ├── Directory.Build.props          # Common build settings
 ├── Dockerfile                     # Container build
 └── README.md                      # This file
+```
+
+## Running Tests
+
+```bash
+cd workers/dotnet
+dotnet test
+```
+
+To run with coverage:
+
+```bash
+dotnet test --collect:"XPlat Code Coverage"
 ```
 
 ## AWS Batch Job Definition

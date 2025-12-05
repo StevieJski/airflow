@@ -52,14 +52,12 @@ COPY . .
 # Build and publish worker
 RUN dotnet publish AirflowWorker/AirflowWorker.csproj \
     -c Release \
-    -o /app \
-    --no-restore
+    -o /app
 
 # Build and publish example handlers
 RUN dotnet publish AirflowWorker.Example/AirflowWorker.Example.csproj \
     -c Release \
-    -o /app/handlers \
-    --no-restore
+    -o /app/handlers
 
 # Runtime stage - use smaller runtime image
 FROM mcr.microsoft.com/dotnet/aspnet:8.0
