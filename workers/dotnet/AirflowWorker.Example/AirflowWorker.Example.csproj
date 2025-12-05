@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>AirflowWorker.Example</RootNamespace>
+    <AssemblyName>AirflowWorker.Example</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AirflowWorker\AirflowWorker.csproj" />
+  </ItemGroup>
+
+  <!-- Optional: Add ML.NET for ML model scenarios -->
+  <!-- Uncomment if you need ML model support -->
+  <!--
+  <ItemGroup>
+    <PackageReference Include="Microsoft.ML" Version="3.0.1" />
+  </ItemGroup>
+  -->
+
+</Project>
