@@ -25,6 +25,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\AirflowWorker\AirflowWorker.csproj" />
+    <ProjectReference Include="..\AirflowWorker.Contracts\AirflowWorker.Contracts.csproj" />
   </ItemGroup>
 
 </Project>

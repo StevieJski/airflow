@@ -17,32 +17,9 @@
 
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using AirflowWorker.Contracts;
 
 namespace AirflowWorker;
-
-/// <summary>
-/// Unique identifier for a task instance, matching Airflow's TaskInstanceKey.
-/// </summary>
-public record TaskInstanceKey
-{
-    [JsonPropertyName("dag_id")]
-    public required string DagId { get; init; }
-
-    [JsonPropertyName("task_id")]
-    public required string TaskId { get; init; }
-
-    [JsonPropertyName("run_id")]
-    public required string RunId { get; init; }
-
-    [JsonPropertyName("try_number")]
-    public required int TryNumber { get; init; }
-
-    [JsonPropertyName("map_index")]
-    public int MapIndex { get; init; } = -1;
-
-    public override string ToString() =>
-        $"{DagId}.{TaskId}[{RunId}]#{TryNumber}" + (MapIndex >= 0 ? $"[{MapIndex}]" : "");
-}
 
 /// <summary>
 /// Message received from SQS task queue.

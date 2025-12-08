@@ -16,6 +16,7 @@
 // under the License.
 
 using System.Text.Json;
+using AirflowWorker.Contracts;
 using FluentAssertions;
 using Xunit;
 

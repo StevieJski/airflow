@@ -39,10 +39,11 @@ FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
 
 # Copy project files first for layer caching
+COPY AirflowWorker.Contracts/*.csproj AirflowWorker.Contracts/
 COPY AirflowWorker/*.csproj AirflowWorker/
 COPY AirflowWorker.Example/*.csproj AirflowWorker.Example/
 
-# Restore dependencies
+# Restore dependencies (Contracts is restored as a dependency of the others)
 RUN dotnet restore AirflowWorker/AirflowWorker.csproj
 RUN dotnet restore AirflowWorker.Example/AirflowWorker.Example.csproj
 

@@ -18,6 +18,7 @@
 using System.Diagnostics;
 using System.Reflection;
 using System.Text.Json;
+using AirflowWorker.Contracts;
 using Amazon.SQS;
 using Amazon.SQS.Model;
 using Microsoft.Extensions.Logging;
@@ -202,7 +203,8 @@ public class WorkerProcess
 
         try
         {
-            var assembly = Assembly.LoadFrom(_initAssembly);
+            var loadContext = new PluginLoadContext(_initAssembly);
+            var assembly = loadContext.LoadFromAssemblyPath(Path.GetFullPath(_initAssembly));
             var type = assembly.GetType(_initType)
                 ?? throw new InvalidOperationException($"Type {_initType} not found in assembly {_initAssembly}");
 
@@ -336,7 +338,8 @@ public class WorkerProcess
             var assemblyPath = assemblyPathObj.ToString()!;
             var typeName = typeNameObj.ToString()!;
 
-            var assembly = Assembly.LoadFrom(assemblyPath);
+            var loadContext = new PluginLoadContext(assemblyPath);
+            var assembly = loadContext.LoadFromAssemblyPath(Path.GetFullPath(assemblyPath));
             var handlerType = assembly.GetType(typeName)
                 ?? throw new InvalidOperationException($"Handler type {typeName} not found in {assemblyPath}");
 

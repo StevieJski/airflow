@@ -6,10 +6,16 @@
     <Nullable>enable</Nullable>
     <RootNamespace>AirflowWorker.Example</RootNamespace>
     <AssemblyName>AirflowWorker.Example</AssemblyName>
+    <!-- Enable dynamic loading for plugins -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\AirflowWorker\AirflowWorker.csproj" />
+    <!-- Reference contracts assembly - do NOT copy to output to prevent type identity issues -->
+    <ProjectReference Include="..\AirflowWorker.Contracts\AirflowWorker.Contracts.csproj">
+      <Private>false</Private>
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </ProjectReference>
   </ItemGroup>
 
   <!-- Optional: Add ML.NET for ML model scenarios -->
