@@ -481,3 +481,5 @@ workers/dotnet/AirflowWorker.Example/bin/*
 workers/dotnet/AirflowWorker.Example/obj/*  
 workers/dotnet/AirflowWorker.Contracts/bin/*
 workers/dotnet/AirflowWorker.Contracts/obj/*
+workers/dotnet/baget-data/*
+workers/dotnet/baget-data/baget.db
