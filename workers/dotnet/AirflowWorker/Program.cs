@@ -18,36 +18,41 @@
 using System.CommandLine;
 using AirflowWorker;
 
-var rootCommand = new RootCommand("Airflow Batch Worker Pool - .NET Worker");
-
-var workerIdOption = new Option<string>("--worker-id", "Unique worker identifier") { IsRequired = true };
-var taskQueueOption = new Option<string>("--task-queue-url", "SQS task queue URL") { IsRequired = true };
-var resultQueueOption = new Option<string>("--result-queue-url", "SQS result queue URL") { IsRequired = true };
-var idleTimeoutOption = new Option<int>("--idle-timeout", () => 300, "Idle timeout in seconds");
-var visibilityTimeoutOption = new Option<int>("--visibility-timeout", () => 3600, "SQS visibility timeout");
-var maxTasksOption = new Option<int>("--max-tasks", () => 0, "Max tasks before terminating (0=unlimited)");
+var workerIdOption = new Option<string>("--worker-id", "Unique worker identifier") { Arity = ArgumentArity.ExactlyOne };
+var taskQueueOption = new Option<string>("--task-queue-url", "SQS task queue URL") { Arity = ArgumentArity.ExactlyOne };
+var resultQueueOption = new Option<string>("--result-queue-url", "SQS result queue URL") { Arity = ArgumentArity.ExactlyOne };
+var idleTimeoutOption = new Option<int>("--idle-timeout", "Idle timeout in seconds");
+idleTimeoutOption.DefaultValueFactory = _ => 300;
+var visibilityTimeoutOption = new Option<int>("--visibility-timeout", "SQS visibility timeout");
+visibilityTimeoutOption.DefaultValueFactory = _ => 3600;
+var maxTasksOption = new Option<int>("--max-tasks", "Max tasks before terminating (0=unlimited)");
+maxTasksOption.DefaultValueFactory = _ => 0;
 var initAssemblyOption = new Option<string?>("--init-assembly", "Assembly containing shared state initializer");
-var initTypeOption = new Option<string>("--init-type", () => "SharedStateInitializer", "Type name for initializer");
+var initTypeOption = new Option<string>("--init-type", "Type name for initializer");
+initTypeOption.DefaultValueFactory = _ => "SharedStateInitializer";
 
-rootCommand.AddOption(workerIdOption);
-rootCommand.AddOption(taskQueueOption);
-rootCommand.AddOption(resultQueueOption);
-rootCommand.AddOption(idleTimeoutOption);
-rootCommand.AddOption(visibilityTimeoutOption);
-rootCommand.AddOption(maxTasksOption);
-rootCommand.AddOption(initAssemblyOption);
-rootCommand.AddOption(initTypeOption);
-
-rootCommand.SetHandler(async (context) =>
+var rootCommand = new RootCommand("Airflow Batch Worker Pool - .NET Worker")
 {
-    var workerId = context.ParseResult.GetValueForOption(workerIdOption)!;
-    var taskQueueUrl = context.ParseResult.GetValueForOption(taskQueueOption)!;
-    var resultQueueUrl = context.ParseResult.GetValueForOption(resultQueueOption)!;
-    var idleTimeout = context.ParseResult.GetValueForOption(idleTimeoutOption);
-    var visibilityTimeout = context.ParseResult.GetValueForOption(visibilityTimeoutOption);
-    var maxTasks = context.ParseResult.GetValueForOption(maxTasksOption);
-    var initAssembly = context.ParseResult.GetValueForOption(initAssemblyOption);
-    var initType = context.ParseResult.GetValueForOption(initTypeOption)!;
+    workerIdOption,
+    taskQueueOption,
+    resultQueueOption,
+    idleTimeoutOption,
+    visibilityTimeoutOption,
+    maxTasksOption,
+    initAssemblyOption,
+    initTypeOption
+};
+
+rootCommand.SetAction(async (parseResult, cancellationToken) =>
+{
+    var workerId = parseResult.GetValue(workerIdOption)!;
+    var taskQueueUrl = parseResult.GetValue(taskQueueOption)!;
+    var resultQueueUrl = parseResult.GetValue(resultQueueOption)!;
+    var idleTimeout = parseResult.GetValue(idleTimeoutOption);
+    var visibilityTimeout = parseResult.GetValue(visibilityTimeoutOption);
+    var maxTasks = parseResult.GetValue(maxTasksOption);
+    var initAssembly = parseResult.GetValue(initAssemblyOption);
+    var initType = parseResult.GetValue(initTypeOption)!;
 
     var worker = new WorkerProcess(
         workerId,
@@ -60,7 +65,7 @@ rootCommand.SetHandler(async (context) =>
         initType
     );
 
-    await worker.RunAsync(context.GetCancellationToken());
+    await worker.RunAsync(cancellationToken);
 });
 
-return await rootCommand.InvokeAsync(args);
+return await rootCommand.Parse(args).InvokeAsync();
