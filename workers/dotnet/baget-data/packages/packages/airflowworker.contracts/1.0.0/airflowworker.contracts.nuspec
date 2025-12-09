@@ -1,0 +1,18 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2012/06/nuspec.xsd">
+  <metadata>
+    <id>AirflowWorker.Contracts</id>
+    <version>1.0.0</version>
+    <authors>Apache Airflow</authors>
+    <license type="expression">Apache-2.0</license>
+    <licenseUrl>https://licenses.nuget.org/Apache-2.0</licenseUrl>
+    <projectUrl>https://github.com/apache/airflow</projectUrl>
+    <description>Contracts and interfaces for implementing Apache Airflow worker tasks in .NET</description>
+    <copyright>Copyright (c) Apache Software Foundation</copyright>
+    <tags>airflow worker contracts</tags>
+    <repository type="git" url="https://github.com/apache/airflow" commit="2dbf19a458414897ad23ad3004a0e1fe9a92ed94" />
+    <dependencies>
+      <group targetFramework="net8.0" />
+    </dependencies>
+  </metadata>
+</package>
