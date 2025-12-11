@@ -23,6 +23,7 @@ that mimics the .NET worker behavior. This tests the core integration:
 2. Worker processes tasks
 3. Worker reports results back via SQS
 4. Worker handles idle timeout
+5. S3-based shared state configuration (env var passing)
 
 This approach tests the infrastructure integration without requiring
 Docker-in-Docker (which is not available in the breeze test environment).
@@ -30,8 +31,14 @@ Docker-in-Docker (which is not available in the breeze test environment).
 For a full .NET worker test, build and push the .NET image externally
 and provide the image URI via the DOTNET_WORKER_IMAGE_URI environment variable.
 
+S3 Shared State Testing:
+- This test creates an S3 bucket with test shared state files
+- The AIRFLOW_SHARED_STATE_S3_URI env var is passed to workers
+- Mock worker: Logs the env var (verifies passing works)
+- Real .NET worker: Downloads files from S3 before initializing shared state
+
 Prerequisites:
-- AWS credentials with permissions for Batch, SQS
+- AWS credentials with permissions for Batch, SQS, S3
 - Environment variables set (see SystemTestContextBuilder below)
 
 To run:
@@ -111,6 +118,14 @@ echo "[$(date)] Task queue: $TASK_QUEUE_URL"
 echo "[$(date)] Result queue: $RESULT_QUEUE_URL"
 echo "[$(date)] Idle timeout: $IDLE_TIMEOUT seconds"
 echo "[$(date)] Max tasks: $MAX_TASKS"
+
+# Log S3 shared state configuration (tests that env var was passed)
+if [ -n "$AIRFLOW_SHARED_STATE_S3_URI" ]; then
+    echo "[$(date)] S3 shared state URI: $AIRFLOW_SHARED_STATE_S3_URI"
+    echo "[$(date)] NOTE: Mock worker does not download from S3. Use real .NET worker for full S3 test."
+else
+    echo "[$(date)] No S3 shared state URI configured"
+fi
 
 # Install AWS CLI v2 and jq (required dependencies)
 echo "[$(date)] Installing AWS CLI and jq..."
@@ -223,6 +238,59 @@ done
 echo "[$(date)] Worker $WORKER_ID shutting down after $tasks_completed tasks"
 exit 0
 '''
+
+
+@task
+def create_shared_state_bucket(env_id: str) -> dict:
+    """Create S3 bucket with test shared state files.
+
+    This tests the S3-based shared state loading feature where workers
+    download pre-serialized state files from S3 before initializing.
+    """
+    s3 = boto3.client("s3")
+    bucket_name = f"{env_id}-shared-state-test"
+
+    # Create bucket (use us-east-1 which doesn't require LocationConstraint)
+    region = boto3.session.Session().region_name
+    if region == "us-east-1":
+        s3.create_bucket(Bucket=bucket_name)
+    else:
+        s3.create_bucket(
+            Bucket=bucket_name,
+            CreateBucketConfiguration={"LocationConstraint": region},
+        )
+
+    # Upload test shared state files
+    reference_data = {
+        "config_version": "1.0",
+        "model_name": "test-model",
+        "environment": "system-test",
+        "test_key": "test_value_from_s3",
+    }
+
+    s3.put_object(
+        Bucket=bucket_name,
+        Key="shared-state/reference-data.json",
+        Body=json.dumps(reference_data),
+        ContentType="application/json",
+    )
+
+    # Add a marker file to verify download worked
+    s3.put_object(
+        Bucket=bucket_name,
+        Key="shared-state/marker.txt",
+        Body=f"Shared state test marker - {env_id}",
+        ContentType="text/plain",
+    )
+
+    s3_uri = f"s3://{bucket_name}/shared-state/"
+    log.info(f"Created shared state bucket: {bucket_name}")
+    log.info(f"Shared state S3 URI: {s3_uri}")
+
+    return {
+        "bucket_name": bucket_name,
+        "s3_uri": s3_uri,
+    }
 
 
 @task
@@ -381,8 +449,17 @@ def submit_worker(
     job_definition: str,
     task_queue_url: str,
     result_queue_url: str,
+    shared_state_s3_uri: str | None = None,
 ) -> str:
-    """Submit a worker job to Batch."""
+    """Submit a worker job to Batch.
+
+    Args:
+        job_queue: Batch job queue name
+        job_definition: Batch job definition name
+        task_queue_url: SQS task queue URL
+        result_queue_url: SQS result queue URL
+        shared_state_s3_uri: Optional S3 URI for shared state files
+    """
     batch = boto3.client("batch")
     worker_id = f"test-worker-{uuid.uuid4().hex[:8]}"
 
@@ -413,13 +490,21 @@ def submit_worker(
             f"/tmp/worker.sh '{worker_id}' '{task_queue_url}' '{result_queue_url}' 60 2",
         ]
 
+    # Build container overrides
+    container_overrides: dict = {"command": command}
+
+    # Add S3 shared state URI as environment variable if provided
+    if shared_state_s3_uri:
+        container_overrides["environment"] = [
+            {"name": "AIRFLOW_SHARED_STATE_S3_URI", "value": shared_state_s3_uri},
+        ]
+        log.info(f"Setting AIRFLOW_SHARED_STATE_S3_URI={shared_state_s3_uri}")
+
     response = batch.submit_job(
         jobName=f"dotnet-worker-{worker_id}",
         jobQueue=job_queue,
         jobDefinition=job_definition,
-        containerOverrides={
-            "command": command,
-        },
+        containerOverrides=container_overrides,
     )
 
     job_id = response["jobId"]
@@ -638,6 +723,33 @@ def delete_sqs_queues(sqs_info: dict):
 
 
 @task(trigger_rule=TriggerRule.ALL_DONE)
+def delete_shared_state_bucket(s3_info: dict):
+    """Delete the S3 bucket and all its contents."""
+    s3 = boto3.client("s3")
+
+    try:
+        bucket_name = s3_info.get("bucket_name")
+        if not bucket_name:
+            log.warning("No bucket name provided, skipping S3 cleanup")
+            return
+
+        # Delete all objects in the bucket first
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket_name):
+            if "Contents" in page:
+                objects = [{"Key": obj["Key"]} for obj in page["Contents"]]
+                if objects:
+                    s3.delete_objects(Bucket=bucket_name, Delete={"Objects": objects})
+                    log.info(f"Deleted {len(objects)} objects from {bucket_name}")
+
+        # Delete the bucket
+        s3.delete_bucket(Bucket=bucket_name)
+        log.info(f"Deleted S3 bucket: {bucket_name}")
+    except Exception as e:
+        log.warning(f"Failed to delete S3 bucket: {e}")
+
+
+@task(trigger_rule=TriggerRule.ALL_DONE)
 def delete_job_definition(job_definition: str):
     """Deregister the job definition."""
     batch = boto3.client("batch")
@@ -723,6 +835,9 @@ with DAG(
     # === SETUP PHASE ===
     sqs_queues = create_sqs_queues(env_id)
 
+    # Create S3 bucket with test shared state files
+    s3_shared_state = create_shared_state_bucket(env_id)
+
     compute_env = create_batch_compute_environment(
         env_id=env_id,
         role_arn=role_arn,
@@ -743,6 +858,7 @@ with DAG(
         job_definition=job_definition,
         task_queue_url=sqs_queues["task_queue_url"],
         result_queue_url=sqs_queues["result_queue_url"],
+        shared_state_s3_uri=s3_shared_state["s3_uri"],
     )
 
     worker_running = wait_for_worker_running(worker_info_json=worker_info)
@@ -761,6 +877,8 @@ with DAG(
 
     cleanup_sqs = delete_sqs_queues(sqs_info=sqs_queues)
 
+    cleanup_s3 = delete_shared_state_bucket(s3_info=s3_shared_state)
+
     cleanup_job_def = delete_job_definition(job_definition=job_definition)
 
     cleanup_job_queue = disable_and_delete_job_queue(job_queue=job_queue)
@@ -778,7 +896,7 @@ with DAG(
         # Setup
         test_context,
         [subnets, security_groups],
-        sqs_queues,
+        [sqs_queues, s3_shared_state],
         compute_env,
         job_queue,
         job_definition,
@@ -790,7 +908,7 @@ with DAG(
         worker_completed,
         # Cleanup
         terminate_worker,
-        [cleanup_sqs, cleanup_job_def],
+        [cleanup_sqs, cleanup_s3, cleanup_job_def],
         cleanup_job_queue,
         cleanup_compute_env,
         log_cleanup,

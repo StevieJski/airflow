@@ -19,6 +19,8 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Text.Json;
 using AirflowWorker.Contracts;
+using Amazon.S3;
+using Amazon.S3.Model;
 using Amazon.SQS;
 using Amazon.SQS.Model;
 using Microsoft.Extensions.Logging;
@@ -191,6 +193,9 @@ public class WorkerProcess
 
     private async Task InitializeSharedStateAsync()
     {
+        // Download shared state from S3 if configured
+        await DownloadSharedStateFromS3Async();
+
         if (string.IsNullOrEmpty(_initAssembly))
         {
             _logger.LogInformation("No shared state initialization configured");
@@ -220,6 +225,77 @@ public class WorkerProcess
         {
             _logger.LogError(ex, "Failed to initialize shared state");
             // Continue anyway - tasks can still run without shared state
+        }
+    }
+
+    private async Task DownloadSharedStateFromS3Async()
+    {
+        var s3Uri = Environment.GetEnvironmentVariable("AIRFLOW_SHARED_STATE_S3_URI");
+        if (string.IsNullOrEmpty(s3Uri))
+        {
+            _logger.LogInformation("No S3 shared state URI configured");
+            return;
+        }
+
+        _logger.LogInformation("Downloading shared state from {S3Uri}", s3Uri);
+
+        try
+        {
+            // Parse S3 URI: s3://bucket/key/path
+            var uri = new Uri(s3Uri);
+            var bucket = uri.Host;
+            var keyPrefix = uri.AbsolutePath.TrimStart('/');
+
+            using var s3Client = new AmazonS3Client();
+            var localBasePath = Path.Combine(Path.GetTempPath(), "airflow-shared-state");
+            Directory.CreateDirectory(localBasePath);
+
+            // List and download all objects under the prefix
+            var listRequest = new ListObjectsV2Request { BucketName = bucket, Prefix = keyPrefix };
+            ListObjectsV2Response listResponse;
+            var downloadedCount = 0;
+
+            do
+            {
+                listResponse = await s3Client.ListObjectsV2Async(listRequest);
+
+                foreach (var obj in listResponse.S3Objects)
+                {
+                    // Skip "directory" markers
+                    if (obj.Key.EndsWith("/")) continue;
+
+                    var relativePath = obj.Key.Substring(keyPrefix.Length).TrimStart('/');
+                    var localPath = Path.Combine(localBasePath, relativePath);
+
+                    // Create subdirectories if needed
+                    var localDir = Path.GetDirectoryName(localPath);
+                    if (!string.IsNullOrEmpty(localDir))
+                    {
+                        Directory.CreateDirectory(localDir);
+                    }
+
+                    _logger.LogDebug("Downloading {Key} to {LocalPath}", obj.Key, localPath);
+
+                    var getResponse = await s3Client.GetObjectAsync(bucket, obj.Key);
+                    await using var fileStream = File.Create(localPath);
+                    await getResponse.ResponseStream.CopyToAsync(fileStream);
+                    downloadedCount++;
+                }
+
+                listRequest.ContinuationToken = listResponse.NextContinuationToken;
+            } while (listResponse.IsTruncated);
+
+            // Set environment variable so ISharedState.InitializeAsync() can find the files
+            Environment.SetEnvironmentVariable("AIRFLOW_SHARED_STATE_LOCAL_PATH", localBasePath);
+
+            _logger.LogInformation(
+                "Downloaded {Count} shared state files to {LocalPath}",
+                downloadedCount, localBasePath);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to download shared state from S3");
+            // Continue anyway - InitializeAsync may still work without pre-downloaded state
         }
     }
 

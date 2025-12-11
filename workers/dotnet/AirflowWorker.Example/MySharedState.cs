@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text.Json;
 using AirflowWorker.Contracts;
 
 namespace AirflowWorker.Example;
@@ -23,21 +24,26 @@ namespace AirflowWorker.Example;
 /// Example shared state implementation that demonstrates how to initialize
 /// expensive resources once and share them across multiple task executions.
 ///
+/// When shared_state_s3_uri is configured, the worker downloads files from S3
+/// to a local temp directory before calling InitializeAsync(). The local path
+/// is available via AIRFLOW_SHARED_STATE_LOCAL_PATH environment variable.
+///
 /// In a real scenario, you might:
-/// - Load ML models (ML.NET, ONNX, TensorFlow)
-/// - Initialize database connection pools
-/// - Load reference data into memory
-/// - Create HTTP clients with connection pooling
+/// - Load ML models (ML.NET, ONNX, TensorFlow) from S3-downloaded files
+/// - Initialize database connection pools (cannot be serialized)
+/// - Load reference data from S3-downloaded JSON files
+/// - Create HTTP clients with connection pooling (cannot be serialized)
 /// </summary>
 public class MySharedState : ISharedState
 {
     /// <summary>
     /// HTTP client configured with connection pooling for external API calls.
+    /// Note: Cannot be serialized - must be created in InitializeAsync.
     /// </summary>
     public HttpClient HttpClient { get; private set; } = null!;
 
     /// <summary>
-    /// Example: Cached reference data that would be expensive to reload per-task.
+    /// Reference data that can be loaded from S3-downloaded JSON file.
     /// </summary>
     public Dictionary<string, string> ReferenceData { get; private set; } = null!;
 
@@ -46,12 +52,25 @@ public class MySharedState : ISharedState
     /// </summary>
     public DateTime InitializedAt { get; private set; }
 
+    /// <summary>
+    /// Path to S3-downloaded shared state files (set by worker before calling InitializeAsync).
+    /// </summary>
+    public string? SharedStatePath { get; private set; }
+
     public async Task InitializeAsync()
     {
         Console.WriteLine("[MySharedState] Initializing shared resources...");
 
+        // Get path to S3-downloaded files (set by worker after downloading from S3)
+        SharedStatePath = Environment.GetEnvironmentVariable("AIRFLOW_SHARED_STATE_LOCAL_PATH");
+
+        if (!string.IsNullOrEmpty(SharedStatePath))
+        {
+            Console.WriteLine($"[MySharedState] Loading from S3-downloaded files at: {SharedStatePath}");
+        }
+
         // Create reusable HTTP client with connection pooling
-        // This avoids TCP connection overhead for each request
+        // Note: HttpClient cannot be serialized - must be created here
         HttpClient = new HttpClient
         {
             BaseAddress = new Uri(
@@ -60,25 +79,49 @@ public class MySharedState : ISharedState
             Timeout = TimeSpan.FromSeconds(30)
         };
 
-        // Simulate loading expensive reference data
-        // In reality, this might load from S3, a database, or a model file
-        await Task.Delay(100); // Simulate I/O delay
-        ReferenceData = new Dictionary<string, string>
-        {
-            ["config_version"] = "1.0",
-            ["model_name"] = "example-model",
-            ["environment"] = Environment.GetEnvironmentVariable("ENVIRONMENT") ?? "development"
-        };
+        // Load reference data from S3-downloaded file or create default
+        ReferenceData = await LoadReferenceDataAsync();
 
         InitializedAt = DateTime.UtcNow;
 
         Console.WriteLine($"[MySharedState] Initialized successfully at {InitializedAt}");
         Console.WriteLine($"[MySharedState] Reference data keys: {string.Join(", ", ReferenceData.Keys)}");
 
-        // Example: If using ML.NET, you would load the model here:
+        // Example: If using ML.NET, load model from S3-downloaded file:
+        // var modelPath = !string.IsNullOrEmpty(SharedStatePath)
+        //     ? Path.Combine(SharedStatePath, "model.zip")
+        //     : Environment.GetEnvironmentVariable("MODEL_PATH") ?? "/models/model.zip";
         // var mlContext = new MLContext();
-        // var modelPath = Environment.GetEnvironmentVariable("MODEL_PATH") ?? "/models/model.zip";
         // Model = mlContext.Model.Load(modelPath, out _);
+    }
+
+    private async Task<Dictionary<string, string>> LoadReferenceDataAsync()
+    {
+        // Try to load from S3-downloaded file first
+        if (!string.IsNullOrEmpty(SharedStatePath))
+        {
+            var refDataPath = Path.Combine(SharedStatePath, "reference-data.json");
+            if (File.Exists(refDataPath))
+            {
+                Console.WriteLine($"[MySharedState] Loading reference data from: {refDataPath}");
+                var json = await File.ReadAllTextAsync(refDataPath);
+                var data = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+                if (data != null)
+                {
+                    Console.WriteLine($"[MySharedState] Loaded {data.Count} reference data entries from S3");
+                    return data;
+                }
+            }
+        }
+
+        // Fallback to default reference data
+        Console.WriteLine("[MySharedState] Using default reference data");
+        return new Dictionary<string, string>
+        {
+            ["config_version"] = "1.0",
+            ["model_name"] = "example-model",
+            ["environment"] = Environment.GetEnvironmentVariable("ENVIRONMENT") ?? "development"
+        };
     }
 
     public async Task DisposeAsync()
