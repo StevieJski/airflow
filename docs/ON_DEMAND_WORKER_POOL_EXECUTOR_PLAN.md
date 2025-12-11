@@ -222,6 +222,7 @@ max_worker_start_attempts = 3
 # Shared State Initialization (optional)
 shared_state_init_module =                 # e.g., myproject.worker_init
 shared_state_init_function = initialize    # Function to call for initialization
+shared_state_s3_uri =                      # e.g., s3://my-bucket/airflow/shared-state
 
 # Submit Job kwargs (JSON)
 submit_job_kwargs = {}
@@ -245,6 +246,7 @@ CONFIG_DEFAULTS = {
     "check_health_on_startup": "True",
     "worker_health_check_interval_seconds": "60",
     "max_worker_start_attempts": "3",
+    "shared_state_s3_uri": "",
 }
 
 class WorkerPoolConfigKeys(BaseConfigKeys):
@@ -280,6 +282,7 @@ class WorkerPoolConfigKeys(BaseConfigKeys):
     # Shared State
     SHARED_STATE_INIT_MODULE = "shared_state_init_module"
     SHARED_STATE_INIT_FUNCTION = "shared_state_init_function"
+    SHARED_STATE_S3_URI = "shared_state_s3_uri"
 ```
 
 ---
@@ -727,6 +730,12 @@ class AwsBatchWorkerPoolExecutor(BaseExecutor):
             {'name': 'AIRFLOW_WORKER_POOL_MODE', 'value': 'true'},
             {'name': 'AIRFLOW_WORKER_ID', 'value': worker_id},
         ])
+
+        # Add S3 shared state URI if configured
+        if self.shared_state_s3_uri:
+            base_kwargs['containerOverrides']['environment'].append(
+                {'name': 'AIRFLOW_SHARED_STATE_S3_URI', 'value': self.shared_state_s3_uri}
+            )
 
         return base_kwargs
 
@@ -1349,6 +1358,8 @@ return await rootCommand.InvokeAsync(args);
 using System.Diagnostics;
 using System.Reflection;
 using System.Text.Json;
+using Amazon.S3;
+using Amazon.S3.Model;
 using Amazon.SQS;
 using Amazon.SQS.Model;
 using Microsoft.Extensions.Logging;
@@ -1472,6 +1483,9 @@ public class WorkerProcess
 
     private async Task InitializeSharedStateAsync()
     {
+        // Download shared state from S3 if configured
+        await DownloadSharedStateFromS3Async();
+
         if (string.IsNullOrEmpty(_initAssembly))
         {
             _logger.LogInformation("No shared state initialization configured");
@@ -1500,6 +1514,71 @@ public class WorkerProcess
         {
             _logger.LogError(ex, "Failed to initialize shared state");
             // Continue anyway - tasks can still run without shared state
+        }
+    }
+
+    private async Task DownloadSharedStateFromS3Async()
+    {
+        var s3Uri = Environment.GetEnvironmentVariable("AIRFLOW_SHARED_STATE_S3_URI");
+        if (string.IsNullOrEmpty(s3Uri))
+        {
+            _logger.LogInformation("No S3 shared state URI configured");
+            return;
+        }
+
+        _logger.LogInformation("Downloading shared state from {S3Uri}", s3Uri);
+
+        try
+        {
+            // Parse S3 URI: s3://bucket/key/path
+            var uri = new Uri(s3Uri);
+            var bucket = uri.Host;
+            var keyPrefix = uri.AbsolutePath.TrimStart('/');
+
+            var s3Client = new AmazonS3Client();
+            var localBasePath = Path.Combine(Path.GetTempPath(), "airflow-shared-state");
+            Directory.CreateDirectory(localBasePath);
+
+            // List and download all objects under the prefix
+            var listRequest = new ListObjectsV2Request { BucketName = bucket, Prefix = keyPrefix };
+            ListObjectsV2Response listResponse;
+
+            do
+            {
+                listResponse = await s3Client.ListObjectsV2Async(listRequest);
+
+                foreach (var obj in listResponse.S3Objects)
+                {
+                    // Skip "directory" markers
+                    if (obj.Key.EndsWith("/")) continue;
+
+                    var relativePath = obj.Key.Substring(keyPrefix.Length).TrimStart('/');
+                    var localPath = Path.Combine(localBasePath, relativePath);
+
+                    // Create subdirectories if needed
+                    Directory.CreateDirectory(Path.GetDirectoryName(localPath)!);
+
+                    _logger.LogDebug("Downloading {Key} to {LocalPath}", obj.Key, localPath);
+
+                    var getResponse = await s3Client.GetObjectAsync(bucket, obj.Key);
+                    await using var fileStream = File.Create(localPath);
+                    await getResponse.ResponseStream.CopyToAsync(fileStream);
+                }
+
+                listRequest.ContinuationToken = listResponse.NextContinuationToken;
+            } while (listResponse.IsTruncated);
+
+            // Set environment variable so ISharedState.InitializeAsync() can find the files
+            Environment.SetEnvironmentVariable("AIRFLOW_SHARED_STATE_LOCAL_PATH", localBasePath);
+
+            _logger.LogInformation(
+                "Downloaded shared state to {LocalPath}",
+                localBasePath);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to download shared state from S3");
+            // Continue anyway - InitializeAsync may still work without pre-downloaded state
         }
     }
 
@@ -1864,12 +1943,17 @@ namespace AirflowWorker.Example;
 
 /// <summary>
 /// Example shared state that loads an ML model once and reuses it across tasks.
+///
+/// When shared_state_s3_uri is configured, the worker downloads files from S3
+/// to a local temp directory before calling InitializeAsync(). The local path
+/// is available via AIRFLOW_SHARED_STATE_LOCAL_PATH environment variable.
 /// </summary>
 public class MySharedState : ISharedState
 {
     public MLContext MlContext { get; private set; } = null!;
     public ITransformer Model { get; private set; } = null!;
     public HttpClient HttpClient { get; private set; } = null!;
+    public Dictionary<string, string> ReferenceData { get; private set; } = null!;
 
     public async Task InitializeAsync()
     {
@@ -1878,14 +1962,32 @@ public class MySharedState : ISharedState
         // Initialize ML.NET context
         MlContext = new MLContext(seed: 42);
 
-        // Load pre-trained model (expensive operation - do once)
-        var modelPath = Environment.GetEnvironmentVariable("MODEL_PATH")
-            ?? "/models/sentiment-model.zip";
+        // Get path to S3-downloaded files (set by worker after downloading from S3)
+        var sharedStatePath = Environment.GetEnvironmentVariable("AIRFLOW_SHARED_STATE_LOCAL_PATH");
 
+        // Load pre-trained model from S3-downloaded files or fallback path
+        var modelPath = !string.IsNullOrEmpty(sharedStatePath)
+            ? Path.Combine(sharedStatePath, "model.zip")  // From S3: simple file read
+            : Environment.GetEnvironmentVariable("MODEL_PATH") ?? "/models/sentiment-model.zip";
+
+        Console.WriteLine($"Loading model from: {modelPath}");
         using var stream = File.OpenRead(modelPath);
         Model = await Task.Run(() => MlContext.Model.Load(stream, out _));
 
-        // Create reusable HTTP client with connection pooling
+        // Load reference data from S3-downloaded JSON file
+        if (!string.IsNullOrEmpty(sharedStatePath))
+        {
+            var refDataPath = Path.Combine(sharedStatePath, "reference-data.json");
+            if (File.Exists(refDataPath))
+            {
+                var json = await File.ReadAllTextAsync(refDataPath);
+                ReferenceData = JsonSerializer.Deserialize<Dictionary<string, string>>(json) ?? new();
+                Console.WriteLine($"Loaded {ReferenceData.Count} reference data entries from S3");
+            }
+        }
+        ReferenceData ??= new Dictionary<string, string>();
+
+        // Create reusable HTTP client with connection pooling (cannot be serialized)
         HttpClient = new HttpClient
         {
             BaseAddress = new Uri(Environment.GetEnvironmentVariable("API_BASE_URL")
@@ -2083,6 +2185,134 @@ private async Task ExecuteTaskAsync(TaskQueueMessage taskMessage)
 
     // Force GC after task to reclaim memory
     GC.Collect(generation: 2, mode: GCCollectionMode.Optimized);
+}
+```
+
+---
+
+### 4c. S3-Based Shared State Loading
+
+As an alternative to code-based initialization via `--init-assembly`, workers can download pre-serialized shared state from S3 at startup. This simplifies `ISharedState.InitializeAsync()` to a simple file read.
+
+#### How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Executor (Scheduler)                               │
+│                                                                              │
+│   1. Read shared_state_s3_uri from config                                   │
+│   2. Pass as AIRFLOW_SHARED_STATE_S3_URI env var to Batch job               │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Worker Container                                   │
+│                                                                              │
+│   3. On startup, DownloadSharedStateFromS3Async() runs:                     │
+│      - Parses S3 URI (s3://bucket/prefix/)                                  │
+│      - Downloads all objects under prefix to /tmp/airflow-shared-state/     │
+│      - Sets AIRFLOW_SHARED_STATE_LOCAL_PATH env var                         │
+│                                                                              │
+│   4. ISharedState.InitializeAsync() runs:                                   │
+│      - Reads AIRFLOW_SHARED_STATE_LOCAL_PATH                                │
+│      - Opens files via simple FileStream (no S3 SDK needed)                 │
+│      - Loads models, reference data, etc.                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Configuration
+
+```ini
+[aws_batch_worker_pool_executor]
+# S3 URI containing pre-serialized shared state files
+shared_state_s3_uri = s3://my-bucket/airflow/shared-state/
+
+# Still need init assembly to process the downloaded files
+shared_state_init_module = myproject.init
+shared_state_init_function = initialize
+```
+
+#### S3 Bucket Structure
+
+```
+s3://my-bucket/airflow/shared-state/
+├── model.zip              # ML model file
+├── model.onnx             # ONNX model
+├── reference-data.json    # Reference data
+├── config.json            # Configuration
+└── embeddings/
+    ├── vectors.bin        # Pre-computed embeddings
+    └── vocab.txt          # Vocabulary file
+```
+
+After download, these appear at:
+```
+/tmp/airflow-shared-state/
+├── model.zip
+├── model.onnx
+├── reference-data.json
+├── config.json
+└── embeddings/
+    ├── vectors.bin
+    └── vocab.txt
+```
+
+#### Environment Variables
+
+| Variable | Set By | Description |
+|----------|--------|-------------|
+| `AIRFLOW_SHARED_STATE_S3_URI` | Executor | S3 URI from config (e.g., `s3://bucket/prefix/`) |
+| `AIRFLOW_SHARED_STATE_LOCAL_PATH` | Worker | Local path after download (e.g., `/tmp/airflow-shared-state`) |
+
+#### Benefits
+
+| Aspect | Code-Based Init | S3-Based Init |
+|--------|-----------------|---------------|
+| **Complexity** | Must implement loading logic | Simple file reads |
+| **Portability** | Init code embedded in assembly | State files can be updated independently |
+| **Cold start** | Download + deserialize | Download from S3 + deserialize |
+| **Versioning** | Tied to code version | Can version state files in S3 |
+| **Debugging** | Must replicate init environment | Can inspect files directly |
+
+#### What Can Be Serialized
+
+| State Type | Serializable | Notes |
+|------------|--------------|-------|
+| ML models (.onnx, .zip, .pb) | ✅ Yes | Primary use case |
+| Reference data (JSON, CSV) | ✅ Yes | Lookup tables, configs |
+| Pre-computed embeddings | ✅ Yes | Vector stores |
+| Database connection pools | ❌ No | Must create in InitializeAsync |
+| HttpClient instances | ❌ No | Must create in InitializeAsync |
+| gRPC channels | ❌ No | Must create in InitializeAsync |
+
+#### Required Dependencies
+
+The .NET worker requires the `AWSSDK.S3` package for S3 downloads:
+
+```xml
+<!-- AirflowWorker/AirflowWorker.csproj -->
+<PackageReference Include="AWSSDK.S3" Version="3.7.400" />
+```
+
+#### Hybrid Approach
+
+Most real implementations will use both S3-downloaded files AND code-based initialization:
+
+```csharp
+public async Task InitializeAsync()
+{
+    var localPath = Environment.GetEnvironmentVariable("AIRFLOW_SHARED_STATE_LOCAL_PATH");
+
+    // Serializable state: read from S3-downloaded files
+    if (!string.IsNullOrEmpty(localPath))
+    {
+        Model = LoadModel(Path.Combine(localPath, "model.onnx"));
+        ReferenceData = LoadJson(Path.Combine(localPath, "reference-data.json"));
+    }
+
+    // Non-serializable state: must initialize in code
+    HttpClient = new HttpClient { BaseAddress = new Uri("https://api.example.com") };
+    DbPool = await CreateConnectionPoolAsync();
 }
 ```
 
@@ -2336,6 +2566,18 @@ aws sqs set-queue-attributes \
         "s3:GetObject"
       ],
       "Resource": "arn:aws:s3:::airflow-logs/*"
+    },
+    {
+      "Sid": "S3SharedState",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::airflow-shared-state",
+        "arn:aws:s3:::airflow-shared-state/*"
+      ]
     }
   ]
 }
