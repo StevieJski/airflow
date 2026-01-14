@@ -7,9 +7,15 @@
     <RootNamespace>AirflowWorker.Contracts</RootNamespace>
     <AssemblyName>AirflowWorker.Contracts</AssemblyName>
 
+    <!-- Strong-name signing (cross-platform): use a local .snk file -->
+    <SignAssembly>true</SignAssembly>
+    <DelaySign>false</DelaySign>
+    <AssemblyOriginatorKeyFile>Quantifi.snk</AssemblyOriginatorKeyFile>
+    <PublicSign>false</PublicSign>
+
     <!-- NuGet Package Configuration -->
     <PackageId>AirflowWorker.Contracts</PackageId>
-    <Version>1.0.2</Version>
+    <Version>1.0.3</Version>
     <Authors>Apache Airflow</Authors>
     <Description>Contracts and interfaces for implementing Apache Airflow worker tasks in .NET</Description>
     <PackageTags>airflow;worker;contracts</PackageTags>
@@ -27,6 +33,11 @@
 
   <ItemGroup>
     <PackageReference Include="System.Text.Json" Version="8.0.6" />
+  </ItemGroup>
+
+  <!-- Do not include the private key in the NuGet package -->
+  <ItemGroup>
+    <None Include="Quantifi.snk" Pack="false" />
   </ItemGroup>
 
 </Project>
