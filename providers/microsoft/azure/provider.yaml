@@ -218,6 +218,9 @@ operators:
     python-modules:
       - airflow.providers.microsoft.azure.operators.powerbi
 
+executors:
+  - airflow.providers.microsoft.azure.executors.batch.AzureBatchWorkerPoolExecutor
+
 sensors:
   - integration-name: Microsoft Azure Cosmos DB
     python-modules:
@@ -379,3 +382,73 @@ config:
         type: string
         example: ~
         default: "airflow-logs"
+
+  azure_batch_worker_pool_executor:
+    description: |
+      Configuration for the Azure Batch Worker Pool Executor.
+      This executor spawns long-running workers in Azure Batch that process
+      multiple Airflow tasks via Azure Service Bus queues.
+    options:
+      azure_batch_conn_id:
+        description: Azure Batch connection ID
+        version_added: 12.10.0
+        type: string
+        default: "azure_batch_default"
+      azure_service_bus_conn_id:
+        description: Azure Service Bus connection ID
+        version_added: 12.10.0
+        type: string
+        default: "azure_service_bus_default"
+      pool_id:
+        description: Azure Batch pool ID for worker tasks
+        version_added: 12.10.0
+        type: string
+        example: "airflow-worker-pool"
+      job_id:
+        description: Azure Batch job ID for worker tasks
+        version_added: 12.10.0
+        type: string
+        example: "airflow-worker-job"
+      task_queue_name:
+        description: Service Bus queue name for task distribution
+        version_added: 12.10.0
+        type: string
+        example: "airflow-tasks"
+      result_queue_name:
+        description: Service Bus queue name for task results
+        version_added: 12.10.0
+        type: string
+        example: "airflow-results"
+      service_bus_namespace:
+        description: Service Bus namespace (required if not using connection string)
+        version_added: 12.10.0
+        type: string
+        example: "myservicebus.servicebus.windows.net"
+      worker_idle_timeout_seconds:
+        description: |
+          How long workers wait idle before self-terminating (seconds)
+        version_added: 12.10.0
+        type: integer
+        default: "300"
+      min_workers:
+        description: Minimum number of workers to keep running
+        version_added: 12.10.0
+        type: integer
+        default: "0"
+      max_workers:
+        description: Maximum number of workers (0 = unlimited)
+        version_added: 12.10.0
+        type: integer
+        default: "0"
+      tasks_per_worker:
+        description: Number of tasks to assign per worker for scaling calculations
+        version_added: 12.10.0
+        type: integer
+        default: "1"
+      shared_state_blob_uri:
+        description: |
+          Azure Blob Storage URI containing shared state files to download
+          at worker startup (ML models, reference data, etc.)
+        version_added: 12.10.0
+        type: string
+        example: "https://account.blob.core.windows.net/container/shared-state/"
