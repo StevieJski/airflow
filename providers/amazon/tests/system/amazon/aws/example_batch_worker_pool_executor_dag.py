@@ -17,8 +17,9 @@
 """
 Example DAG demonstrating the AwsBatchWorkerPoolExecutor architecture.
 
-This DAG shows how normal Airflow tasks are automatically executed on
-long-running AWS Batch worker processes when using the AwsBatchWorkerPoolExecutor.
+This DAG reads task definitions from pool_worker_test_data.json and dynamically
+generates Airflow tasks that are executed on long-running AWS Batch workers
+(including .NET workers) via the AwsBatchWorkerPoolExecutor.
 
 Architecture Overview:
 ======================
@@ -29,40 +30,48 @@ Architecture Overview:
 │  │              AwsBatchWorkerPoolExecutor                                 │ │
 │  │                                                                          │ │
 │  │  1. Receives tasks from scheduler                                        │ │
-│  │  2. Sends task messages to SQS Task Queue                               │ │
+│  │  2. Sends TaskQueueMessage to SQS Task Queue                            │ │
+│  │     - task_key: identifies the Airflow task                             │ │
+│  │     - executor_config: contains GridTask data for .NET worker           │ │
 │  │  3. Spawns/scales AWS Batch workers as needed                           │ │
-│  │  4. Polls SQS Result Queue for completions                              │ │
+│  │  4. Polls SQS Result Queue for TaskResultMessage                        │ │
 │  │  5. Reports task state back to scheduler                                │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
-                                    │ Tasks auto-routed via SQS
+                                    │ SQS Messages (shared schema)
                                     v
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│                         AWS Batch Worker Pool                                │
+│                    AWS Batch Worker Pool (.NET or Python)                    │
 │                                                                               │
 │   ┌─────────────────────────────────────────────────────────────────────┐    │
 │   │  Long-Running Worker Containers                                      │    │
 │   │                                                                      │    │
-│   │  - Workers poll SQS Task Queue                                       │    │
-│   │  - Execute tasks in isolated subprocesses                            │    │
-│   │  - Send results to SQS Result Queue                                  │    │
+│   │  - Workers poll SQS Task Queue for TaskQueueMessage                  │    │
+│   │  - Extract GridTask from executor_config["GridTask"]                 │    │
+│   │  - Load shared state from S3 (cached in parent process)              │    │
+│   │  - Execute task in isolated subprocess                               │    │
+│   │  - Send TaskResultMessage to SQS Result Queue                        │    │
 │   │  - Self-terminate after idle timeout                                 │    │
-│   │  - Can share state (models, connections) across tasks                │    │
 │   └─────────────────────────────────────────────────────────────────────┘    │
 └───────────────────────────────────────────────────────────────────────────────┘
 
-Key Benefits:
-- DAG code contains NO explicit SQS or Batch API calls
-- Tasks are just normal Python functions with @task decorators
-- Executor handles all infrastructure orchestration
-- Workers can share expensive resources (ML models, DB pools) across tasks
-- Automatic scaling based on task queue depth
+Key Differences from example_batch_worker_pool_dag.py:
+======================================================
+
+| Aspect              | example_batch_worker_pool_dag.py | This DAG (executor-based)      |
+|---------------------|----------------------------------|--------------------------------|
+| SQS calls           | Explicit send_message/receive    | None - executor handles        |
+| Batch job submit    | Explicit submit_job              | None - executor handles        |
+| Task generation     | Single task sends all to SQS     | Dynamic Airflow @task mapping  |
+| Task tracking       | Manual polling of result queue   | Executor handles automatically |
+| Worker management   | Manual submit/wait/cleanup       | Executor scales automatically  |
+| Task data passing   | JSON in SQS message body         | executor_config on @task       |
 
 Prerequisites:
 ==============
 
-1. Configure the executor in airflow.cfg:
+1. Configure the executor in airflow.cfg or via environment variables:
 
    [core]
    executor = airflow.providers.amazon.aws.executors.batch.AwsBatchWorkerPoolExecutor
@@ -75,204 +84,278 @@ Prerequisites:
    task_queue_url = https://sqs.us-east-1.amazonaws.com/123456789012/airflow-tasks
    result_queue_url = https://sqs.us-east-1.amazonaws.com/123456789012/airflow-results
    worker_idle_timeout_seconds = 300
-   shared_state_s3_uri = s3://my-bucket/airflow/shared-state/
 
-2. Ensure AWS infrastructure exists:
-   - AWS Batch job queue and compute environment
-   - Job definition with worker container image
-   - SQS queues for task and result messages
-   - S3 bucket for shared state (optional)
+2. Place pool_worker_test_data.json in the tests/ subdirectory
 
 3. Configure aws_default connection in Airflow UI
 
-Usage:
-======
-
-Simply trigger this DAG from the Airflow UI. The executor will:
-1. Queue tasks to SQS
-2. Spawn workers on AWS Batch
-3. Workers execute tasks and report results
-4. Executor marks tasks as success/failed
-
-The DAG code itself is just normal Airflow task definitions!
+4. The job_definition should point to your .NET worker container image
 """
 from __future__ import annotations
 
+import json
 import logging
-import time
-from datetime import datetime
+import os
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 
 from airflow.sdk import DAG, task
+from airflow.models import Variable
+from airflow.providers.amazon.aws.hooks.base_aws import AwsBaseHook
 
 log = logging.getLogger(__name__)
 
 DAG_ID = "example_batch_worker_pool_executor"
 
+# Path to test data file (in tests subdirectory)
+TEST_DATA_FILE = Path(__file__).parent / "tests" / "pool_worker_test_data.json"
+
+# Maximum number of tasks to generate (set to 0 or negative for all tasks)
+MAX_TASKS = int(os.environ.get("AIRFLOW_WORKER_POOL_MAX_TASKS", "10"))
+
+# AWS connection ID
+AWS_CONN_ID = "aws_default"
+
+
+def get_config(key: str, env_var: str) -> str | None:
+    """Get configuration from Airflow Variable or environment variable."""
+    try:
+        return Variable.get(f"batch_worker_pool.{key}")
+    except Exception:
+        return os.environ.get(env_var)
+
+
+def load_test_data() -> dict:
+    """Load test data from pool_worker_test_data.json."""
+    if not TEST_DATA_FILE.exists():
+        log.warning(f"Test data file not found: {TEST_DATA_FILE}")
+        return {"SharedState": {}, "Tasks": []}
+
+    with open(TEST_DATA_FILE) as f:
+        return json.load(f)
+
+
+def get_task_definitions() -> list[dict]:
+    """Get task definitions from test data file.
+
+    Returns a list of task definitions, limited by MAX_TASKS.
+    """
+    test_data = load_test_data()
+    tasks = test_data.get("Tasks", [])
+
+    if MAX_TASKS and MAX_TASKS > 0:
+        tasks = tasks[:MAX_TASKS]
+
+    return tasks
+
+
+def get_shared_state() -> dict:
+    """Get shared state configuration from test data file."""
+    test_data = load_test_data()
+    return test_data.get("SharedState", {})
+
+
+def get_aws_client(service_name: str):
+    """Get a boto3 client using Airflow's AWS connection."""
+    hook = AwsBaseHook(aws_conn_id=AWS_CONN_ID, client_type=service_name)
+    return hook.get_conn()
+
+
+def parse_s3_uri(s3_uri: str) -> tuple[str, str]:
+    """Parse S3 URI into bucket and key prefix."""
+    if not s3_uri.startswith("s3://"):
+        raise ValueError(f"Invalid S3 URI: {s3_uri}")
+    path = s3_uri[5:]  # Remove 's3://'
+    parts = path.split("/", 1)
+    bucket = parts[0]
+    prefix = parts[1] if len(parts) > 1 else ""
+    return bucket, prefix
+
 
 # =============================================================================
-# EXAMPLE TASKS
+# TASK DEFINITIONS
 #
-# These are regular Airflow tasks. When using AwsBatchWorkerPoolExecutor,
-# these tasks are automatically:
-# 1. Serialized and sent to SQS by the executor
-# 2. Picked up by long-running AWS Batch workers
-# 3. Executed in isolated subprocess on the worker
-# 4. Results reported back via SQS result queue
-#
-# NO explicit SQS or Batch code needed in the DAG!
+# These tasks use executor_config to pass data to the .NET worker.
+# When using AwsBatchWorkerPoolExecutor:
+# 1. Executor serializes the task and sends TaskQueueMessage to SQS
+# 2. The executor_config dict is included in the message
+# 3. .NET worker extracts GridTask from executor_config["GridTask"]
+# 4. Worker processes the task and sends TaskResultMessage
+# 5. Executor polls results and updates Airflow task state
 # =============================================================================
 
 
 @task
-def extract_data() -> dict:
-    """Extract data from a source.
+def upload_shared_state() -> dict:
+    """Upload SharedState to S3 for workers to access.
 
-    This task simulates extracting data. When executed on a worker pool,
-    the worker can maintain persistent connections to data sources.
+    This task uploads the shared state configuration that workers will
+    load at startup. The executor passes the S3 URI to workers.
+
+    Returns:
+        Dict with S3 location details
     """
-    log.info("Extracting data from source...")
+    s3_uri = get_config("shared_state_s3_uri", "AIRFLOW_SHARED_STATE_S3_URI")
+    if not s3_uri:
+        raise ValueError("AIRFLOW_SHARED_STATE_S3_URI not configured")
 
-    # Simulate data extraction
-    data = {
-        "records": [
-            {"id": 1, "name": "Alice", "value": 100},
-            {"id": 2, "name": "Bob", "value": 200},
-            {"id": 3, "name": "Charlie", "value": 300},
-        ],
-        "source": "example_database",
-        "extracted_at": datetime.utcnow().isoformat(),
+    s3 = get_aws_client("s3")
+    shared_state = get_shared_state()
+
+    run_name = (
+        shared_state.get("RiskRun", {}).get("RunId", {}).get("Name")
+        or f"executor_run_{uuid.uuid4().hex[:8]}"
+    )
+
+    bucket, prefix = parse_s3_uri(s3_uri)
+
+    # Upload shared state as JSON
+    shared_state_key = f"{prefix}{run_name}.json".lstrip("/")
+    s3.put_object(
+        Bucket=bucket,
+        Key=shared_state_key,
+        Body=json.dumps(shared_state, indent=2),
+        ContentType="application/json",
+    )
+
+    log.info(f"Uploaded shared state to s3://{bucket}/{shared_state_key}")
+
+    return {
+        "bucket": bucket,
+        "prefix": prefix,
+        "shared_state_key": shared_state_key,
+        "s3_uri": s3_uri,
+        "run_name": run_name,
     }
 
-    log.info(f"Extracted {len(data['records'])} records")
-    return data
+
+def create_grid_task(task_index: int, task_data: dict, run_name: str) -> callable:
+    """Create a task function for a specific grid task.
+
+    This factory function creates individual Airflow tasks that pass
+    GridTask data to the .NET worker via executor_config.
+
+    Args:
+        task_index: Index of the task (for task_id naming)
+        task_data: The task definition from pool_worker_test_data.json
+        run_name: The run name for this execution
+
+    Returns:
+        A decorated task function
+    """
+    task_name = task_data.get("TaskName", f"task_{task_index}")
+
+    @task(
+        task_id=f"grid_task_{task_index}",
+        # executor_config is passed to the worker via TaskQueueMessage
+        # The .NET worker extracts GridTask from executor_config["GridTask"]
+        executor_config={
+            "GridTask": task_data,
+            "run_name": run_name,
+            "task_index": task_index,
+        },
+    )
+    def grid_task(shared_state_info: dict) -> dict:
+        """Process a grid task on the worker pool.
+
+        When executed via AwsBatchWorkerPoolExecutor:
+        - This function's executor_config is sent to the worker
+        - The .NET worker extracts GridTask and processes it
+        - Results are reported back via SQS
+
+        When executed locally (without the executor):
+        - This function runs as a placeholder, logging the task info
+        """
+        log.info(f"Grid task {task_name} (index {task_index})")
+        log.info(f"  SharedState S3: {shared_state_info.get('s3_uri')}")
+        log.info(f"  Run name: {shared_state_info.get('run_name')}")
+
+        # When running locally (not via executor), just return placeholder result
+        # The actual processing happens in the .NET worker
+        return {
+            "task_name": task_name,
+            "task_index": task_index,
+            "status": "completed",
+            "run_name": shared_state_info.get("run_name"),
+        }
+
+    return grid_task
 
 
 @task
-def transform_data(raw_data: dict) -> dict:
-    """Transform the extracted data.
+def aggregate_results(results: list[dict], shared_state_info: dict) -> dict:
+    """Aggregate results from all grid tasks.
 
-    This task processes the data. On a worker pool, expensive resources
-    like ML models can be loaded once and reused across multiple tasks.
+    Args:
+        results: List of results from all grid task executions
+        shared_state_info: S3 location info for shared state
+
+    Returns:
+        Aggregated summary of all task results
     """
-    log.info("Transforming data...")
+    total_tasks = len(results)
+    completed = sum(1 for r in results if r.get("status") == "completed")
+    failed = sum(1 for r in results if r.get("status") == "failed")
 
-    records = raw_data.get("records", [])
-    transformed = []
-
-    for record in records:
-        transformed.append({
-            "id": record["id"],
-            "name": record["name"].upper(),
-            "value": record["value"] * 2,
-            "category": "high" if record["value"] > 150 else "low",
-        })
-
-    result = {
-        "records": transformed,
-        "source": raw_data.get("source"),
-        "transformed_at": datetime.utcnow().isoformat(),
-        "record_count": len(transformed),
+    summary = {
+        "run_name": shared_state_info.get("run_name"),
+        "total_tasks": total_tasks,
+        "completed": completed,
+        "failed": failed,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    log.info(f"Transformed {len(transformed)} records")
-    return result
+    log.info(f"Run {summary['run_name']} completed:")
+    log.info(f"  Total tasks: {total_tasks}")
+    log.info(f"  Completed: {completed}")
+    log.info(f"  Failed: {failed}")
 
-
-@task
-def load_data(transformed_data: dict) -> str:
-    """Load transformed data to destination.
-
-    This task writes data to a destination. Worker pools can maintain
-    connection pools for efficient database writes.
-    """
-    log.info("Loading data to destination...")
-
-    record_count = transformed_data.get("record_count", 0)
-
-    # Simulate loading data
-    time.sleep(1)
-
-    log.info(f"Loaded {record_count} records to destination")
-
-    return f"Successfully loaded {record_count} records"
-
-
-@task
-def validate_results(load_status: str, transformed_data: dict) -> dict:
-    """Validate the ETL pipeline results.
-
-    This task performs validation checks on the pipeline output.
-    """
-    log.info("Validating results...")
-
-    validation = {
-        "status": "passed",
-        "checks": [],
-        "validated_at": datetime.utcnow().isoformat(),
-    }
-
-    # Check 1: Load was successful
-    if "Successfully" in load_status:
-        validation["checks"].append({"check": "load_success", "passed": True})
-    else:
-        validation["checks"].append({"check": "load_success", "passed": False})
-        validation["status"] = "failed"
-
-    # Check 2: Records were processed
-    record_count = transformed_data.get("record_count", 0)
-    if record_count > 0:
-        validation["checks"].append({"check": "records_processed", "passed": True, "count": record_count})
-    else:
-        validation["checks"].append({"check": "records_processed", "passed": False})
-        validation["status"] = "failed"
-
-    log.info(f"Validation {validation['status']}: {len(validation['checks'])} checks completed")
-
-    return validation
-
-
-@task
-def notify_completion(validation: dict) -> str:
-    """Send notification about pipeline completion.
-
-    This is the final task that reports the pipeline outcome.
-    """
-    status = validation.get("status", "unknown")
-
-    if status == "passed":
-        message = "ETL pipeline completed successfully!"
-    else:
-        message = "ETL pipeline completed with validation failures"
-
-    log.info(f"Pipeline notification: {message}")
-
-    return message
+    return summary
 
 
 # =============================================================================
 # DAG DEFINITION
 #
-# This is a standard Airflow DAG with TaskFlow API.
-# The AwsBatchWorkerPoolExecutor handles all the infrastructure.
+# This DAG dynamically generates one Airflow task per task record in
+# pool_worker_test_data.json. Each task passes its GridTask data via
+# executor_config, which the AwsBatchWorkerPoolExecutor includes in the
+# SQS message for the .NET worker to process.
 # =============================================================================
+
+# Load task definitions at DAG parse time
+TASK_DEFINITIONS = get_task_definitions()
+SHARED_STATE = get_shared_state()
+RUN_NAME = (
+    SHARED_STATE.get("RiskRun", {}).get("RunId", {}).get("Name")
+    or f"executor_run_{uuid.uuid4().hex[:8]}"
+)
 
 with DAG(
     dag_id=DAG_ID,
     schedule=None,  # Manual trigger only
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=["example", "aws", "batch", "worker-pool", "executor"],
+    tags=["example", "aws", "batch", "worker-pool", "executor", "dynamic"],
     doc_md=__doc__,
     default_args={
         "retries": 1,
     },
 ) as dag:
-    # Define the ETL pipeline
-    raw = extract_data()
-    transformed = transform_data(raw)
-    loaded = load_data(transformed)
-    validated = validate_results(loaded, transformed)
-    notify = notify_completion(validated)
+    # === SETUP: Upload shared state to S3 ===
+    shared_state_info = upload_shared_state()
 
-    # Dependencies are automatically inferred from task inputs/outputs
-    # raw >> transformed >> loaded >> validated >> notify
+    # === EXECUTION: Create a task for each grid task definition ===
+    # Each task passes GridTask data to the worker via executor_config
+    grid_tasks = []
+    for idx, task_def in enumerate(TASK_DEFINITIONS):
+        grid_task_fn = create_grid_task(idx, task_def, RUN_NAME)
+        grid_task_instance = grid_task_fn(shared_state_info=shared_state_info)
+        grid_tasks.append(grid_task_instance)
+
+    # === AGGREGATION: Collect results from all tasks ===
+    if grid_tasks:
+        summary = aggregate_results(
+            results=grid_tasks,
+            shared_state_info=shared_state_info,
+        )
