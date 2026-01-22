@@ -15,7 +15,7 @@
 
     <!-- NuGet Package Configuration -->
     <PackageId>AirflowWorker.Contracts</PackageId>
-    <Version>1.0.3</Version>
+    <Version>1.0.4</Version>
     <Authors>Apache Airflow</Authors>
     <Description>Contracts and interfaces for implementing Apache Airflow worker tasks in .NET</Description>
     <PackageTags>airflow;worker;contracts</PackageTags>

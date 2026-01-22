@@ -111,8 +111,8 @@ class AwsBatchWorkerPoolExecutor(BaseExecutor):
         self.tasks_in_queue: dict[TaskInstanceKey, TaskQueueMessage] = {}
 
         # Health state
-        self.IS_BOTO_CONNECTION_HEALTHY = False
-        self.last_connection_reload = None
+        self.IS_BOTO_CONNECTION_HEALTHY = True  # Assume healthy until proven otherwise
+        self.last_connection_reload = timezone.utcnow()  # Initialize to avoid None errors
         self.last_worker_health_check = None
         self.attempts_since_last_successful_connection = 0
 
@@ -196,6 +196,19 @@ class AwsBatchWorkerPoolExecutor(BaseExecutor):
             CONFIG_GROUP_NAME, WorkerPoolConfigKeys.SUBMIT_JOB_KWARGS, fallback="{}"
         )
         self.submit_job_kwargs = json.loads(submit_job_kwargs_str) if submit_job_kwargs_str else {}
+
+        # Native Worker mode (for .NET or other non-Python workers with their own entrypoint)
+        self.use_native_worker = conf.getboolean(
+            CONFIG_GROUP_NAME,
+            WorkerPoolConfigKeys.USE_NATIVE_WORKER,
+            fallback=CONFIG_DEFAULTS["use_native_worker"].lower() == "true",
+        )
+
+        # Airflow Execution API URL (required for native workers to transition task state)
+        # Falls back to api.base_url if not explicitly configured
+        self.execution_api_url = conf.get(
+            CONFIG_GROUP_NAME, WorkerPoolConfigKeys.EXECUTION_API_URL, fallback=None
+        ) or conf.get("api", "base_url", fallback=None)
 
     #
     # Lifecycle Methods
@@ -314,6 +327,7 @@ class AwsBatchWorkerPoolExecutor(BaseExecutor):
                 workload_json=workload_json,
                 executor_config=executor_config,
                 enqueued_at=timezone.utcnow(),
+                execution_api_url=self.execution_api_url,
             )
 
             # Send to SQS
@@ -350,6 +364,13 @@ class AwsBatchWorkerPoolExecutor(BaseExecutor):
         - Poll result queue for completed tasks
         - Submit pending worker starts
         """
+        # DEBUG: Log when sync is called
+        self.log.warning(
+            "SYNC CALLED! tasks_in_queue=%d, running=%d, queued_tasks=%d",
+            len(self.tasks_in_queue),
+            len(self.running),
+            len(self.queued_tasks),
+        )
         if not self.IS_BOTO_CONNECTION_HEALTHY:
             exponential_backoff_retry(
                 self.last_connection_reload,
@@ -451,9 +472,18 @@ class AwsBatchWorkerPoolExecutor(BaseExecutor):
 
     def _scale_workers(self):
         """Scale workers based on queue depth and parallelism."""
+        # DEBUG: Log scaling check
+        self.log.warning("SCALE_WORKERS called!")
         # Calculate desired workers
         tasks_pending = self._get_queue_depth()
         current_workers = len(self.active_workers)
+        self.log.warning(
+            "SCALE CHECK: tasks_pending=%d, current_workers=%d, max_workers=%d, parallelism=%d",
+            tasks_pending,
+            current_workers,
+            self.max_workers,
+            self.parallelism,
+        )
 
         # Respect parallelism limit
         max_allowed = self.max_workers if self.max_workers > 0 else self.parallelism
@@ -473,8 +503,9 @@ class AwsBatchWorkerPoolExecutor(BaseExecutor):
                 tasks_pending,
                 current_workers,
             )
-            for i in range(workers_to_add):
-                self._request_worker_start(worker_id=f"scale-{timezone.utcnow().timestamp()}-{i}")
+            # Queue batch of workers to add - will be submitted as array job if > 1
+            base_worker_id = f"scale-{int(timezone.utcnow().timestamp())}"
+            self._request_workers_batch(base_worker_id=base_worker_id, count=workers_to_add)
 
         # Note: Scale down happens automatically via worker idle timeout
 
@@ -489,45 +520,95 @@ class AwsBatchWorkerPoolExecutor(BaseExecutor):
         in_flight = int(attrs.get("ApproximateNumberOfMessagesNotVisible", 0))
         return visible + in_flight
 
-    def _request_worker_start(self, worker_id: str):
-        """Queue a worker start request."""
+    def _request_workers_batch(self, base_worker_id: str, count: int):
+        """Queue a batch of workers to start.
+
+        If count > 1, will be submitted as an array job.
+        If count == 1, will be submitted as individual job.
+        """
         self.pending_worker_starts.append(
             WorkerStartRequest(
-                worker_id=worker_id,
+                worker_id=base_worker_id,
                 attempt_number=1,
                 next_attempt_time=timezone.utcnow(),
+                batch_size=count,  # New field for batch size
             )
         )
 
     def _submit_pending_worker_starts(self):
-        """Submit pending worker start requests to AWS Batch."""
+        """Submit pending worker start requests to AWS Batch.
+
+        Uses array jobs when batch_size > 1 for efficiency.
+        """
+        self.log.warning(
+            "SUBMIT_PENDING_WORKER_STARTS: %d pending requests", len(self.pending_worker_starts)
+        )
         for _ in range(len(self.pending_worker_starts)):
             request = self.pending_worker_starts.popleft()
 
             # Check if we've hit the max workers limit
             max_allowed = self.max_workers if self.max_workers > 0 else self.parallelism
-            if len(self.active_workers) >= max_allowed:
-                self.log.debug("Max workers reached, skipping worker start")
+            current_count = len(self.active_workers)
+            if current_count >= max_allowed:
+                self.log.warning(
+                    "Max workers reached (%d >= %d), skipping worker start",
+                    current_count,
+                    max_allowed,
+                )
                 continue
+
+            # Adjust batch size if it would exceed max workers
+            batch_size = request.batch_size
+            if current_count + batch_size > max_allowed:
+                batch_size = max_allowed - current_count
+                self.log.info(
+                    "Reducing batch size from %d to %d to respect max_workers limit",
+                    request.batch_size,
+                    batch_size,
+                )
 
             # Check retry timing
             if timezone.utcnow() < request.next_attempt_time:
+                self.log.warning("Worker batch %s not ready yet, re-queuing", request.worker_id)
                 self.pending_worker_starts.append(request)
                 continue
 
             try:
-                job_id = self._start_worker(request.worker_id)
-                self.active_workers.add_worker(
-                    job_id=job_id,
-                    worker_id=request.worker_id,
-                    started_at=timezone.utcnow(),
-                )
-                self.log.info("Started worker %s (Batch job: %s)", request.worker_id, job_id)
+                if batch_size == 1:
+                    # Single worker - use individual job submission
+                    self.log.info("Submitting single worker job: %s", request.worker_id)
+                    job_id = self._start_worker(f"{request.worker_id}-0")
+                    self.active_workers.add_worker(
+                        job_id=job_id,
+                        worker_id=f"{request.worker_id}-0",
+                        started_at=timezone.utcnow(),
+                    )
+                    self.log.info("Started worker %s-0 (Batch job: %s)", request.worker_id, job_id)
+                else:
+                    # Multiple workers - use array job
+                    self.log.info(
+                        "Submitting array job with %d workers: base_id=%s",
+                        batch_size,
+                        request.worker_id,
+                    )
+                    parent_job_id = self._start_array_job(request.worker_id, batch_size)
+                    self.active_workers.add_array_job(
+                        parent_job_id=parent_job_id,
+                        base_worker_id=request.worker_id,
+                        array_size=batch_size,
+                        started_at=timezone.utcnow(),
+                    )
+                    self.log.info(
+                        "Started array job %s with %d workers (base: %s)",
+                        parent_job_id,
+                        batch_size,
+                        request.worker_id,
+                    )
 
             except ClientError as e:
                 if request.attempt_number >= self.max_worker_start_attempts:
                     self.log.error(
-                        "Failed to start worker %s after %d attempts: %s",
+                        "Failed to start workers %s after %d attempts: %s",
                         request.worker_id,
                         request.attempt_number,
                         e,
@@ -538,69 +619,161 @@ class AwsBatchWorkerPoolExecutor(BaseExecutor):
                         request.attempt_number
                     )
                     self.pending_worker_starts.append(request)
+            except Exception as e:
+                self.log.error(
+                    "UNEXPECTED ERROR starting workers %s: %s", request.worker_id, e, exc_info=True
+                )
+                # Re-queue for retry
+                if request.attempt_number < self.max_worker_start_attempts:
+                    request.attempt_number += 1
+                    request.next_attempt_time = timezone.utcnow() + calculate_next_attempt_delay(
+                        request.attempt_number
+                    )
+                    self.pending_worker_starts.append(request)
 
     def _start_worker(self, worker_id: str) -> str:
-        """Submit a worker job to AWS Batch. Returns job ID."""
+        """Submit a single worker job to AWS Batch. Returns job ID."""
         job_name = f"{self.worker_job_name_prefix}-{worker_id}"
+        self.log.info("Submitting single worker job: %s", job_name)
 
         submit_kwargs = self._build_worker_submit_kwargs(worker_id)
 
-        response = self.batch_client.submit_job(
-            jobName=job_name,
-            jobQueue=self.job_queue,
-            jobDefinition=self.job_definition,
-            **submit_kwargs,
-        )
+        try:
+            response = self.batch_client.submit_job(
+                jobName=job_name,
+                jobQueue=self.job_queue,
+                jobDefinition=self.job_definition,
+                **submit_kwargs,
+            )
+            self.log.info("Started worker %s (job_id: %s)", worker_id, response["jobId"])
+            return response["jobId"]
+        except Exception as e:
+            self.log.error("Failed to start worker %s: %s", worker_id, e, exc_info=True)
+            raise
 
-        return response["jobId"]
+    def _start_array_job(self, base_worker_id: str, array_size: int) -> str:
+        """Submit an array job to AWS Batch. Returns parent job ID.
 
-    def _build_worker_submit_kwargs(self, worker_id: str) -> dict[str, Any]:
-        """Build kwargs for Batch submit_job API."""
+        Array jobs create multiple child jobs (indexed 0 to array_size-1).
+        Each child gets AWS_BATCH_JOB_ARRAY_INDEX environment variable set automatically.
+        """
+        job_name = f"{self.worker_job_name_prefix}-array-{base_worker_id}"
+        self.log.info("Submitting array job: %s (size=%d)", job_name, array_size)
+
+        # Build kwargs with base worker ID - workers will append array index
+        submit_kwargs = self._build_worker_submit_kwargs(base_worker_id, is_array_job=True)
+
+        # Add array properties
+        submit_kwargs["arrayProperties"] = {"size": array_size}
+
+        try:
+            response = self.batch_client.submit_job(
+                jobName=job_name,
+                jobQueue=self.job_queue,
+                jobDefinition=self.job_definition,
+                **submit_kwargs,
+            )
+            parent_job_id = response["jobId"]
+            self.log.info(
+                "Started array job %s with %d workers (parent_job_id: %s)",
+                job_name,
+                array_size,
+                parent_job_id,
+            )
+            return parent_job_id
+        except Exception as e:
+            self.log.error("Failed to start array job %s: %s", job_name, e, exc_info=True)
+            raise
+
+    def _build_worker_submit_kwargs(self, worker_id: str, is_array_job: bool = False) -> dict[str, Any]:
+        """Build kwargs for Batch submit_job API.
+
+        Args:
+            worker_id: Worker ID (or base worker ID for array jobs)
+            is_array_job: If True, worker ID is a base ID and workers should append
+                         AWS_BATCH_JOB_ARRAY_INDEX to construct their full ID
+        """
         base_kwargs = deepcopy(self.submit_job_kwargs)
 
         if "containerOverrides" not in base_kwargs:
             base_kwargs["containerOverrides"] = {}
 
-        # Set worker command
-        command = [
-            "python",
-            "-m",
-            "airflow.providers.amazon.aws.executors.batch.worker_pool_worker",
-            "--worker-id",
-            worker_id,
-            "--task-queue-url",
-            self.task_queue_url,
-            "--result-queue-url",
-            self.result_queue_url,
-            "--idle-timeout",
-            str(self.worker_idle_timeout_seconds),
-            "--visibility-timeout",
-            str(self.worker_visibility_timeout_seconds),
-        ]
-
-        # Add shared state init if configured
-        if self.shared_state_init_module:
-            command.extend(
-                [
-                    "--init-module",
-                    self.shared_state_init_module,
-                    "--init-function",
-                    self.shared_state_init_function or "initialize",
-                ]
-            )
-
-        base_kwargs["containerOverrides"]["command"] = command
-
-        # Set environment variables
+        # Set environment variables first (needed for both native and Python workers)
         if "environment" not in base_kwargs["containerOverrides"]:
             base_kwargs["containerOverrides"]["environment"] = []
 
-        base_kwargs["containerOverrides"]["environment"].extend(
-            [
-                {"name": "AIRFLOW_WORKER_POOL_MODE", "value": "true"},
-                {"name": "AIRFLOW_WORKER_ID", "value": worker_id},
+        # Core environment variables for all workers
+        # For array jobs, AIRFLOW_WORKER_ID_BASE is set and worker appends array index
+        # For individual jobs, AIRFLOW_WORKER_ID is the full worker ID
+        env_vars = [
+            {"name": "AIRFLOW_WORKER_POOL_MODE", "value": "true"},
+            {"name": "AIRFLOW_TASK_QUEUE_URL", "value": self.task_queue_url},
+            {"name": "AIRFLOW_RESULT_QUEUE_URL", "value": self.result_queue_url},
+            {"name": "AIRFLOW_WORKER_IDLE_TIMEOUT", "value": str(self.worker_idle_timeout_seconds)},
+            {"name": "AIRFLOW_WORKER_VISIBILITY_TIMEOUT", "value": str(self.worker_visibility_timeout_seconds)},
+        ]
+
+        if is_array_job:
+            # For array jobs, pass base worker ID - workers construct full ID as {base}-{array_index}
+            # AWS_BATCH_JOB_ARRAY_INDEX is automatically set by AWS Batch for each child job
+            env_vars.append({"name": "AIRFLOW_WORKER_ID_BASE", "value": worker_id})
+            env_vars.append({"name": "AIRFLOW_IS_ARRAY_JOB", "value": "true"})
+        else:
+            # For individual jobs, pass the full worker ID
+            env_vars.append({"name": "AIRFLOW_WORKER_ID", "value": worker_id})
+
+        # Add Execution API URL for native workers to transition task state
+        if self.execution_api_url:
+            env_vars.append({"name": "AIRFLOW_EXECUTION_API_URL", "value": self.execution_api_url})
+        elif self.use_native_worker:
+            self.log.warning(
+                "use_native_worker is enabled but execution_api_url is not configured. "
+                "Native workers will not be able to transition tasks from QUEUED to RUNNING, "
+                "which will cause 'state mismatch' errors. Set execution_api_url in [%s] config.",
+                CONFIG_GROUP_NAME,
+            )
+
+        base_kwargs["containerOverrides"]["environment"].extend(env_vars)
+
+        if self.use_native_worker:
+            # Native worker mode: don't override command, let container use its default entrypoint
+            # The native worker (e.g., .NET) reads configuration from environment variables
+            self.log.info(
+                "Using native worker mode - container will use its default entrypoint. "
+                "Worker ID: %s, Task Queue: %s",
+                worker_id,
+                self.task_queue_url,
+            )
+        else:
+            # Python worker mode: set command to run the airflow worker module
+            command = [
+                "python",
+                "-m",
+                "airflow.providers.amazon.aws.executors.batch.worker_pool_worker",
+                "--worker-id",
+                worker_id,
+                "--task-queue-url",
+                self.task_queue_url,
+                "--result-queue-url",
+                self.result_queue_url,
+                "--idle-timeout",
+                str(self.worker_idle_timeout_seconds),
+                "--visibility-timeout",
+                str(self.worker_visibility_timeout_seconds),
             ]
-        )
+
+            # Add shared state init if configured
+            if self.shared_state_init_module:
+                command.extend(
+                    [
+                        "--init-module",
+                        self.shared_state_init_module,
+                        "--init-function",
+                        self.shared_state_init_function or "initialize",
+                    ]
+                )
+
+            base_kwargs["containerOverrides"]["command"] = command
 
         return base_kwargs
 
@@ -609,7 +782,11 @@ class AwsBatchWorkerPoolExecutor(BaseExecutor):
     #
 
     def _check_worker_health(self):
-        """Check health of active workers via AWS Batch describe_jobs."""
+        """Check health of active workers via AWS Batch describe_jobs.
+
+        For array jobs, we query child job IDs (format: parent_id:index).
+        AWS Batch describe_jobs API accepts both individual and child job IDs.
+        """
         if not self.active_workers:
             return
 
@@ -621,6 +798,7 @@ class AwsBatchWorkerPoolExecutor(BaseExecutor):
             return
         self.last_worker_health_check = now
 
+        # Get all job IDs (includes array job child IDs like "parent_id:0", "parent_id:1", etc.)
         job_ids = self.active_workers.get_all_job_ids()
 
         for i in range(0, len(job_ids), self.DESCRIBE_JOBS_BATCH_SIZE):

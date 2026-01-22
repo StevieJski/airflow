@@ -17,6 +17,7 @@
 
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using AirflowWorker;
 
 namespace AirflowWorker.Contracts;
 
@@ -134,4 +135,30 @@ public record TaskExecutionContext
     /// Cast to your concrete shared state type to access resources.
     /// </summary>
     public ISharedState? SharedState { get; init; }
+}
+
+/// <summary>
+/// Interface for communicating with the Airflow Execution API.
+/// The Execution API is used to transition task states and report progress.
+/// </summary>
+public interface IAirflowExecutionApi
+{
+    /// <summary>
+    /// Transition a task instance from QUEUED to RUNNING state.
+    /// Must be called before executing the task.
+    /// </summary>
+    /// <param name="taskInstanceId">The UUID of the task instance (from workload.ti.id)</param>
+    /// <param name="token">JWT authentication token (from workload.token)</param>
+    /// <param name="hostname">The hostname of the worker</param>
+    /// <param name="pid">The process ID of the worker</param>
+    /// <param name="unixname">The unix username running the worker</param>
+    /// <param name="cancellationToken">Cancellation token</param>
+    /// <returns>Run context with additional task information, or null if the call failed</returns>
+    Task<TIRunContext?> StartTaskAsync(
+        Guid taskInstanceId,
+        string token,
+        string hostname,
+        int pid,
+        string unixname,
+        CancellationToken cancellationToken = default);
 }

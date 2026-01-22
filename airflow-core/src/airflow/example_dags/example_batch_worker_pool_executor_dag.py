@@ -105,10 +105,11 @@ from botocore.exceptions import ClientError
 
 from airflow.sdk import DAG, task
 from airflow.providers.amazon.aws.hooks.base_aws import AwsBaseHook
+from airflow.operators.empty import EmptyOperator
 
 log = logging.getLogger(__name__)
 
-DAG_ID = "example_batch_worker_pool_executor"
+DAG_ID = "example_batch_worker_pool_executor_2"
 
 # Path to test data file (same directory as DAG)
 TEST_DATA_FILE = Path(__file__).parent / "pool_worker_test_data.json"
@@ -184,8 +185,15 @@ def extract_run_name(shared_state: dict) -> str:
 def upload_shared_state_at_parse_time() -> dict:
     """Upload shared state to S3 during DAG parse time.
 
-    Uses content-hash in S3 key for idempotency. Checks if object
-    exists before uploading to avoid redundant writes on repeated parses.
+    Uses S3 object metadata to store content hash for idempotency. Compares
+    the hash of current content against the stored metadata to avoid redundant
+    uploads on repeated DAG parses.
+
+    The filename is kept consistent (based on run_name only, no hash), so
+    downstream workers don't need to handle changing filenames.
+
+    Note: Uses boto3 directly (not AwsBaseHook) to avoid database access
+    at parse time. Relies on default AWS credentials (env vars, IAM role, etc).
 
     Returns:
         Dict with S3 location info, or error info if upload fails
@@ -203,27 +211,40 @@ def upload_shared_state_at_parse_time() -> dict:
     content_hash = compute_content_hash(shared_state)
     bucket, prefix = parse_s3_uri(s3_uri)
     run_name = extract_run_name(shared_state)
-    shared_state_key = f"{prefix}{run_name}_{content_hash}.json".lstrip("/")
+    # Use consistent filename without hash - hash is stored in metadata
+    shared_state_key = f"{prefix}{run_name}.json".lstrip("/")
 
     try:
-        s3 = get_aws_client("s3")
+        # Use boto3 directly to avoid database access at parse time
+        import boto3
 
-        # Check if object already exists (HEAD request)
+        s3 = boto3.client("s3")
+
+        # Check if object already exists and has matching content hash in metadata
+        needs_upload = True
         try:
-            s3.head_object(Bucket=bucket, Key=shared_state_key)
-            log.debug(f"Shared state already exists: s3://{bucket}/{shared_state_key}")
+            response = s3.head_object(Bucket=bucket, Key=shared_state_key)
+            existing_hash = response.get("Metadata", {}).get("content-hash")
+            if existing_hash == content_hash:
+                log.debug(f"Shared state unchanged (hash={content_hash}): s3://{bucket}/{shared_state_key}")
+                needs_upload = False
+            else:
+                log.info(f"Shared state changed (old={existing_hash}, new={content_hash}), re-uploading")
         except ClientError as e:
             if e.response["Error"]["Code"] == "404":
-                # Object doesn't exist, upload it
-                s3.put_object(
-                    Bucket=bucket,
-                    Key=shared_state_key,
-                    Body=json.dumps(shared_state, indent=2),
-                    ContentType="application/json",
-                )
-                log.info(f"Uploaded shared state to s3://{bucket}/{shared_state_key}")
+                log.debug(f"Shared state does not exist, will upload: s3://{bucket}/{shared_state_key}")
             else:
                 raise
+
+        if needs_upload:
+            s3.put_object(
+                Bucket=bucket,
+                Key=shared_state_key,
+                Body=json.dumps(shared_state, indent=2),
+                ContentType="application/json",
+                Metadata={"content-hash": content_hash},
+            )
+            log.info(f"Uploaded shared state to s3://{bucket}/{shared_state_key} (hash={content_hash})")
 
         return {
             "bucket": bucket,
@@ -231,6 +252,7 @@ def upload_shared_state_at_parse_time() -> dict:
             "shared_state_key": shared_state_key,
             "s3_uri": s3_uri,
             "run_name": run_name,
+            "content_hash": content_hash,
         }
 
     except Exception as e:
@@ -271,7 +293,7 @@ def create_grid_task(
     task_name = task_data.get("TaskName", f"task_{task_index}")
 
     @task(
-        task_id=f"grid_task_{task_index}",
+        task_id=task_name,
         # executor_config is passed to the worker via TaskQueueMessage
         # The .NET worker extracts GridTask from executor_config["GridTask"]
         executor_config={
@@ -321,10 +343,18 @@ def create_grid_task(
 # =============================================================================
 
 # Load task definitions and upload shared state at DAG parse time
-TASK_DEFINITIONS = get_task_definitions()
-SHARED_STATE = get_shared_state()
-RUN_NAME = extract_run_name(SHARED_STATE)
-SHARED_STATE_INFO = upload_shared_state_at_parse_time()
+# Wrapped in try/except to ensure DAG still loads even if there are issues
+try:
+    TASK_DEFINITIONS = get_task_definitions()
+    SHARED_STATE = get_shared_state()
+    RUN_NAME = extract_run_name(SHARED_STATE)
+    SHARED_STATE_INFO = upload_shared_state_at_parse_time()
+except Exception as e:
+    log.error(f"Error during DAG parse-time initialization: {e}")
+    TASK_DEFINITIONS = []
+    SHARED_STATE = {}
+    RUN_NAME = "error"
+    SHARED_STATE_INFO = {"error": str(e)}
 
 with DAG(
     dag_id=DAG_ID,
@@ -337,9 +367,13 @@ with DAG(
         "retries": 1,
     },
 ) as dag:
+
+    # Placeholder start task to ensure DAG is valid even with no grid tasks
+    start_task = EmptyOperator(task_id="start")
+
     # === EXECUTION: Create a task for each grid task definition ===
     # Each task passes GridTask data to the worker via executor_config
     # Shared state info is embedded in executor_config (uploaded at parse time)
     for idx, task_def in enumerate(TASK_DEFINITIONS):
         grid_task_fn = create_grid_task(idx, task_def, RUN_NAME, SHARED_STATE_INFO)
-        grid_task_fn()
+        start_task >> grid_task_fn()

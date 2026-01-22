@@ -68,6 +68,10 @@ class TaskQueueMessage(BaseModel):
     workload_json: str = Field(description="JSON-serialized ExecuteTask workload")
     executor_config: dict[str, Any] = Field(default_factory=dict)
     enqueued_at: datetime
+    execution_api_url: str | None = Field(
+        default=None,
+        description="URL of the Airflow Execution API for transitioning task state",
+    )
 
 
 class TaskResultInfo(BaseModel):

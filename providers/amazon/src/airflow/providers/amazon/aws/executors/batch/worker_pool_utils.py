@@ -44,6 +44,7 @@ CONFIG_DEFAULTS = {
     "max_worker_start_attempts": "3",
     "worker_job_name_prefix": "airflow-worker",
     "shared_state_init_function": "initialize",
+    "use_native_worker": "False",
 }
 
 
@@ -83,6 +84,12 @@ class WorkerPoolConfigKeys(BaseConfigKeys):
     SHARED_STATE_INIT_MODULE = "shared_state_init_module"
     SHARED_STATE_INIT_FUNCTION = "shared_state_init_function"
 
+    # Native Worker (e.g., .NET worker that has its own entrypoint)
+    USE_NATIVE_WORKER = "use_native_worker"
+
+    # Airflow Execution API URL (required for native workers to transition task state)
+    EXECUTION_API_URL = "execution_api_url"
+
 
 @dataclass
 class WorkerInfo:
@@ -93,15 +100,34 @@ class WorkerInfo:
     started_at: datetime
     tasks_assigned: int = 0
     last_seen: datetime | None = None
+    # For array job children, this is the parent job ID
+    parent_job_id: str | None = None
+    # For array job children, this is the array index
+    array_index: int | None = None
 
 
 @dataclass
 class WorkerStartRequest:
-    """Request to start a new worker."""
+    """Request to start new worker(s).
 
-    worker_id: str
+    If batch_size > 1, will be submitted as an array job.
+    """
+
+    worker_id: str  # Base worker ID (array index appended for array jobs)
     attempt_number: int
     next_attempt_time: datetime
+    batch_size: int = 1  # Number of workers to start (1 = individual, >1 = array job)
+
+
+@dataclass
+class ArrayJobInfo:
+    """Information about an array job (parent)."""
+
+    parent_job_id: str
+    base_worker_id: str
+    array_size: int
+    child_job_ids: list[str]
+    started_at: datetime
 
 
 class WorkerCollection:
@@ -110,12 +136,45 @@ class WorkerCollection:
     def __init__(self):
         self.job_id_to_worker: dict[str, WorkerInfo] = {}
         self.worker_id_to_job_id: dict[str, str] = {}
+        # Track array jobs: parent_job_id -> ArrayJobInfo
+        self.array_jobs: dict[str, ArrayJobInfo] = {}
 
     def add_worker(self, job_id: str, worker_id: str, started_at: datetime):
         """Add a worker to the collection."""
         info = WorkerInfo(worker_id=worker_id, job_id=job_id, started_at=started_at)
         self.job_id_to_worker[job_id] = info
         self.worker_id_to_job_id[worker_id] = job_id
+
+    def add_array_job(
+        self, parent_job_id: str, base_worker_id: str, array_size: int, started_at: datetime
+    ):
+        """Add an array job and all its child workers to the collection.
+
+        For array jobs, child job IDs are formatted as "parent_job_id:index".
+        """
+        child_job_ids = [f"{parent_job_id}:{i}" for i in range(array_size)]
+
+        # Store array job info
+        self.array_jobs[parent_job_id] = ArrayJobInfo(
+            parent_job_id=parent_job_id,
+            base_worker_id=base_worker_id,
+            array_size=array_size,
+            child_job_ids=child_job_ids,
+            started_at=started_at,
+        )
+
+        # Add each child as a worker
+        for i, child_job_id in enumerate(child_job_ids):
+            worker_id = f"{base_worker_id}-{i}"
+            info = WorkerInfo(
+                worker_id=worker_id,
+                job_id=child_job_id,
+                started_at=started_at,
+                parent_job_id=parent_job_id,
+                array_index=i,
+            )
+            self.job_id_to_worker[child_job_id] = info
+            self.worker_id_to_job_id[worker_id] = child_job_id
 
     def pop_by_job_id(self, job_id: str) -> WorkerInfo:
         """Remove and return worker by job ID."""
@@ -139,6 +198,7 @@ class WorkerCollection:
         """Clear all workers."""
         self.job_id_to_worker.clear()
         self.worker_id_to_job_id.clear()
+        self.array_jobs.clear()
 
     def __len__(self):
         return len(self.job_id_to_worker)
