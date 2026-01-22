@@ -93,15 +93,17 @@ Prerequisites:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
+from botocore.exceptions import ClientError
+
 from airflow.sdk import DAG, task
-from airflow.models import Variable
 from airflow.providers.amazon.aws.hooks.base_aws import AwsBaseHook
 
 log = logging.getLogger(__name__)
@@ -116,14 +118,6 @@ MAX_TASKS = int(os.environ.get("AIRFLOW_WORKER_POOL_MAX_TASKS", "10"))
 
 # AWS connection ID
 AWS_CONN_ID = "aws_default"
-
-
-def get_config(key: str, env_var: str) -> str | None:
-    """Get configuration from Airflow Variable or environment variable."""
-    try:
-        return Variable.get(f"batch_worker_pool.{key}")
-    except Exception:
-        return os.environ.get(env_var)
 
 
 def load_test_data() -> dict:
@@ -173,6 +167,77 @@ def parse_s3_uri(s3_uri: str) -> tuple[str, str]:
     return bucket, prefix
 
 
+def compute_content_hash(data: dict) -> str:
+    """Compute MD5 hash of JSON content for deduplication."""
+    content = json.dumps(data, sort_keys=True, separators=(",", ":"))
+    return hashlib.md5(content.encode()).hexdigest()[:16]
+
+
+def extract_run_name(shared_state: dict) -> str:
+    """Extract run name from shared state or generate one."""
+    return (
+        shared_state.get("RiskRun", {}).get("RunId", {}).get("Name")
+        or f"executor_run_{uuid.uuid4().hex[:8]}"
+    )
+
+
+def upload_shared_state_at_parse_time() -> dict:
+    """Upload shared state to S3 during DAG parse time.
+
+    Uses content-hash in S3 key for idempotency. Checks if object
+    exists before uploading to avoid redundant writes on repeated parses.
+
+    Returns:
+        Dict with S3 location info, or error info if upload fails
+    """
+    s3_uri = os.environ.get("AIRFLOW_SHARED_STATE_S3_URI")
+    if not s3_uri:
+        log.warning("AIRFLOW_SHARED_STATE_S3_URI not configured - shared state will not be uploaded")
+        return {"error": "AIRFLOW_SHARED_STATE_S3_URI not configured"}
+
+    shared_state = get_shared_state()
+    if not shared_state:
+        log.warning("No shared state found in test data")
+        return {"error": "No shared state found"}
+
+    content_hash = compute_content_hash(shared_state)
+    bucket, prefix = parse_s3_uri(s3_uri)
+    run_name = extract_run_name(shared_state)
+    shared_state_key = f"{prefix}{run_name}_{content_hash}.json".lstrip("/")
+
+    try:
+        s3 = get_aws_client("s3")
+
+        # Check if object already exists (HEAD request)
+        try:
+            s3.head_object(Bucket=bucket, Key=shared_state_key)
+            log.debug(f"Shared state already exists: s3://{bucket}/{shared_state_key}")
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "404":
+                # Object doesn't exist, upload it
+                s3.put_object(
+                    Bucket=bucket,
+                    Key=shared_state_key,
+                    Body=json.dumps(shared_state, indent=2),
+                    ContentType="application/json",
+                )
+                log.info(f"Uploaded shared state to s3://{bucket}/{shared_state_key}")
+            else:
+                raise
+
+        return {
+            "bucket": bucket,
+            "prefix": prefix,
+            "shared_state_key": shared_state_key,
+            "s3_uri": s3_uri,
+            "run_name": run_name,
+        }
+
+    except Exception as e:
+        log.warning(f"Failed to upload shared state at parse time: {e}")
+        return {"error": str(e), "s3_uri": s3_uri, "run_name": run_name}
+
+
 # =============================================================================
 # TASK DEFINITIONS
 #
@@ -186,51 +251,9 @@ def parse_s3_uri(s3_uri: str) -> tuple[str, str]:
 # =============================================================================
 
 
-@task
-def upload_shared_state() -> dict:
-    """Upload SharedState to S3 for workers to access.
-
-    This task uploads the shared state configuration that workers will
-    load at startup. The executor passes the S3 URI to workers.
-
-    Returns:
-        Dict with S3 location details
-    """
-    s3_uri = get_config("shared_state_s3_uri", "AIRFLOW_SHARED_STATE_S3_URI")
-    if not s3_uri:
-        raise ValueError("AIRFLOW_SHARED_STATE_S3_URI not configured")
-
-    s3 = get_aws_client("s3")
-    shared_state = get_shared_state()
-
-    run_name = (
-        shared_state.get("RiskRun", {}).get("RunId", {}).get("Name")
-        or f"executor_run_{uuid.uuid4().hex[:8]}"
-    )
-
-    bucket, prefix = parse_s3_uri(s3_uri)
-
-    # Upload shared state as JSON
-    shared_state_key = f"{prefix}{run_name}.json".lstrip("/")
-    s3.put_object(
-        Bucket=bucket,
-        Key=shared_state_key,
-        Body=json.dumps(shared_state, indent=2),
-        ContentType="application/json",
-    )
-
-    log.info(f"Uploaded shared state to s3://{bucket}/{shared_state_key}")
-
-    return {
-        "bucket": bucket,
-        "prefix": prefix,
-        "shared_state_key": shared_state_key,
-        "s3_uri": s3_uri,
-        "run_name": run_name,
-    }
-
-
-def create_grid_task(task_index: int, task_data: dict, run_name: str) -> callable:
+def create_grid_task(
+    task_index: int, task_data: dict, run_name: str, shared_state_info: dict
+) -> callable:
     """Create a task function for a specific grid task.
 
     This factory function creates individual Airflow tasks that pass
@@ -240,6 +263,7 @@ def create_grid_task(task_index: int, task_data: dict, run_name: str) -> callabl
         task_index: Index of the task (for task_id naming)
         task_data: The task definition from pool_worker_test_data.json
         run_name: The run name for this execution
+        shared_state_info: S3 location info for shared state (uploaded at parse time)
 
     Returns:
         A decorated task function
@@ -254,9 +278,10 @@ def create_grid_task(task_index: int, task_data: dict, run_name: str) -> callabl
             "GridTask": task_data,
             "run_name": run_name,
             "task_index": task_index,
+            "shared_state_info": shared_state_info,
         },
     )
-    def grid_task(shared_state_info: dict) -> dict:
+    def grid_task() -> dict:
         """Process a grid task on the worker pool.
 
         When executed via AwsBatchWorkerPoolExecutor:
@@ -283,37 +308,6 @@ def create_grid_task(task_index: int, task_data: dict, run_name: str) -> callabl
     return grid_task
 
 
-@task
-def aggregate_results(results: list[dict], shared_state_info: dict) -> dict:
-    """Aggregate results from all grid tasks.
-
-    Args:
-        results: List of results from all grid task executions
-        shared_state_info: S3 location info for shared state
-
-    Returns:
-        Aggregated summary of all task results
-    """
-    total_tasks = len(results)
-    completed = sum(1 for r in results if r.get("status") == "completed")
-    failed = sum(1 for r in results if r.get("status") == "failed")
-
-    summary = {
-        "run_name": shared_state_info.get("run_name"),
-        "total_tasks": total_tasks,
-        "completed": completed,
-        "failed": failed,
-        "completed_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    log.info(f"Run {summary['run_name']} completed:")
-    log.info(f"  Total tasks: {total_tasks}")
-    log.info(f"  Completed: {completed}")
-    log.info(f"  Failed: {failed}")
-
-    return summary
-
-
 # =============================================================================
 # DAG DEFINITION
 #
@@ -321,15 +315,16 @@ def aggregate_results(results: list[dict], shared_state_info: dict) -> dict:
 # pool_worker_test_data.json. Each task passes its GridTask data via
 # executor_config, which the AwsBatchWorkerPoolExecutor includes in the
 # SQS message for the .NET worker to process.
+#
+# Shared state is uploaded to S3 at DAG parse time (not as a task), so
+# grid tasks can start immediately without waiting for an upload task.
 # =============================================================================
 
-# Load task definitions at DAG parse time
+# Load task definitions and upload shared state at DAG parse time
 TASK_DEFINITIONS = get_task_definitions()
 SHARED_STATE = get_shared_state()
-RUN_NAME = (
-    SHARED_STATE.get("RiskRun", {}).get("RunId", {}).get("Name")
-    or f"executor_run_{uuid.uuid4().hex[:8]}"
-)
+RUN_NAME = extract_run_name(SHARED_STATE)
+SHARED_STATE_INFO = upload_shared_state_at_parse_time()
 
 with DAG(
     dag_id=DAG_ID,
@@ -342,20 +337,9 @@ with DAG(
         "retries": 1,
     },
 ) as dag:
-    # === SETUP: Upload shared state to S3 ===
-    shared_state_info = upload_shared_state()
-
     # === EXECUTION: Create a task for each grid task definition ===
     # Each task passes GridTask data to the worker via executor_config
-    grid_tasks = []
+    # Shared state info is embedded in executor_config (uploaded at parse time)
     for idx, task_def in enumerate(TASK_DEFINITIONS):
-        grid_task_fn = create_grid_task(idx, task_def, RUN_NAME)
-        grid_task_instance = grid_task_fn(shared_state_info=shared_state_info)
-        grid_tasks.append(grid_task_instance)
-
-    # === AGGREGATION: Collect results from all tasks ===
-    if grid_tasks:
-        summary = aggregate_results(
-            results=grid_tasks,
-            shared_state_info=shared_state_info,
-        )
+        grid_task_fn = create_grid_task(idx, task_def, RUN_NAME, SHARED_STATE_INFO)
+        grid_task_fn()
