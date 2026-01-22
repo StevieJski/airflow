@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "aws-cli": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["aws-mcp"],
+      "env": {
+        "AWS_PROFILE": "",
+        "AWS_REGION": ""
+      }
+    }
+  }
+}
